@@ -635,7 +635,7 @@ export async function listBookings(options?: {
       feeAmountOriginal: bookings[0].feeAmountOriginal,
       hasFee: !!(bookings[0].feeAmount && Number(bookings[0].feeAmount) > 0),
     } : null,
-    bookingsWithFee: bookings.filter(b => b.feeAmount && Number(b.feeAmount) > 0).length,
+    bookingsWithFee: bookings.filter((b: Booking) => b.feeAmount && Number(b.feeAmount) > 0).length,
   })
 
   // Apply overlap filter if enabled
@@ -646,7 +646,7 @@ export async function listBookings(options?: {
     // Check each booking for overlaps (in parallel for better performance)
     const { createBangkokTimestamp } = await import('./timezone')
     const overlapChecks = await Promise.all(
-      bookings.map(async (booking) => {
+      bookings.map(async (booking: Booking) => {
         // formatBooking returns dates as YYYY-MM-DD strings, convert to Unix timestamps
         const startDate = booking.startDate 
           ? createBangkokTimestamp(booking.startDate, booking.startTime || null)
@@ -667,13 +667,13 @@ export async function listBookings(options?: {
     
     // Filter to only bookings with overlaps
     bookings = overlapChecks
-      .filter(check => check.overlapCount > 0)
-      .map(check => check.booking)
+      .filter((check: { booking: Booking; overlapCount: number }) => check.overlapCount > 0)
+      .map((check: { booking: Booking; overlapCount: number }) => check.booking)
     
     // Re-apply sorting after filtering (in case order changed)
     const sortBy = options?.sortBy || "created_at"
     const sortOrder = options?.sortOrder || "DESC"
-    bookings.sort((a, b) => {
+    bookings.sort((a: Booking, b: Booking) => {
       let aVal: any, bVal: any
       switch (sortBy) {
         case "created_at":
@@ -911,21 +911,12 @@ export async function autoUpdateFinishedBookings(): Promise<{
     reason: string
   }> = []
 
-  console.log(`[autoUpdateFinishedBookings] Processing ${result.rows.length} bookings. Current time (Bangkok): ${new Date(now * 1000).toISOString()}`)
-  
   for (const row of result.rows) {
     const bookingRow = row as any
     const startTimestamp = await calculateReservationStartTimestamp(
       bookingRow.start_date,
       bookingRow.start_time
     )
-    
-    // Debug logging for pending/pending_deposit bookings
-    if (bookingRow.status === "pending" || bookingRow.status === "pending_deposit") {
-      const startDateStr = bookingRow.start_date ? new Date(bookingRow.start_date * 1000).toISOString() : 'null'
-      const startTimestampStr = startTimestamp ? new Date(startTimestamp * 1000).toISOString() : 'null'
-      console.log(`[autoUpdateFinishedBookings] ${bookingRow.status} booking ${bookingRow.id}: start_date=${startDateStr}, start_time=${bookingRow.start_time || 'null'}, startTimestamp=${startTimestampStr}, now=${new Date(now * 1000).toISOString()}, shouldCancel=${startTimestamp && startTimestamp < now}`)
-    }
     
     // Check pending, pending_deposit, and paid_deposit bookings - cancel if start date passed
     if (bookingRow.status === "pending" || bookingRow.status === "pending_deposit" || bookingRow.status === "paid_deposit") {
@@ -936,7 +927,6 @@ export async function autoUpdateFinishedBookings(): Promise<{
       if (bookingRow.start_time && startTimestamp) {
         // Has start_time: compare timestamp directly (already in Bangkok timezone)
         shouldCancel = startTimestamp < now
-        console.log(`[autoUpdateFinishedBookings] ${bookingRow.status} booking ${bookingRow.id} with start_time: startTimestamp=${new Date(startTimestamp * 1000).toISOString()}, now=${new Date(now * 1000).toISOString()}, shouldCancel=${shouldCancel}`)
       } else if (bookingRow.start_date) {
         // No start_time: compare dates (if start_date is before today, cancel)
         // Get today's date in Bangkok timezone (at start of day)
@@ -961,11 +951,9 @@ export async function autoUpdateFinishedBookings(): Promise<{
         
         // If start_date (start of day) is before today (start of day), cancel it
         shouldCancel = startDateStartTimestamp < todayStartTimestamp
-        console.log(`[autoUpdateFinishedBookings] ${bookingRow.status} booking ${bookingRow.id} has no start_time: start_date=${new Date(bookingRow.start_date * 1000).toISOString()}, startDateStart=${new Date(startDateStartTimestamp * 1000).toISOString()}, today_start=${new Date(todayStartTimestamp * 1000).toISOString()}, shouldCancel=${shouldCancel}`)
       }
       
       if (shouldCancel) {
-        console.log(`[autoUpdateFinishedBookings] Cancelling ${bookingRow.status} booking ${bookingRow.id} - start date/time has passed`)
         const newStatus = "cancelled"
         const changeReason = bookingRow.status === "pending"
           ? "Automatically cancelled: reservation start date/time has passed without deposit confirmation"
@@ -1058,11 +1046,12 @@ export async function autoUpdateFinishedBookings(): Promise<{
             })
 
             // Send cancellation email to user
-            // Fix #7: Duplicate prevention is handled in sendBookingStatusNotification
+            // CRITICAL: Always send cancellation notification - user needs to know booking was cancelled
             try {
               const emailBooking = { ...fullBooking, status: "cancelled" as const }
               await sendBookingStatusNotification(emailBooking, "cancelled", {
                 changeReason: changeReason,
+                skipDuplicateCheck: true, // Always send - user needs to know booking was cancelled
               })
               console.log(`Cancellation email sent to user for booking ${bookingRow.id} (pending/postponed - start date passed)`)
             } catch (emailError) {
@@ -1181,10 +1170,12 @@ export async function autoUpdateFinishedBookings(): Promise<{
             })
 
             // Send finished email to user
+            // CRITICAL: Always send finished notification - user should know booking is complete
             try {
               const emailBooking = { ...fullBooking, status: "finished" as const }
               await sendBookingStatusNotification(emailBooking, "finished", {
                 changeReason: changeReason,
+                skipDuplicateCheck: true, // Always send - user needs to know booking is finished
               })
               console.log(`Finished email sent to user for booking ${bookingRow.id}`)
             } catch (emailError) {
@@ -1411,9 +1402,10 @@ export async function updateBookingStatus(
     // Token is needed for:
     // 1. pending_deposit status (user can upload deposit)
     // 2. paid_deposit status (user can access booking details via token)
+    const isPendingToPendingDeposit = finalStatus === "pending_deposit" && oldStatus === "pending"
     const needsNewToken = 
       // Generate for pending_deposit if coming from pending (admin accepts booking)
-      (finalStatus === "pending_deposit" && oldStatus === "pending") ||
+      isPendingToPendingDeposit ||
       // Generate for pending_deposit if restoring from cancelled (archive restoration)
       (finalStatus === "pending_deposit" && oldStatus === "cancelled") ||
       // Generate for paid_deposit if restoring from cancelled (archive restoration - user needs token to access booking details)
@@ -1422,6 +1414,11 @@ export async function updateBookingStatus(
       !currentBooking.response_token ||
       // Generate if existing token is expired
       (currentBooking.token_expires_at && currentBooking.token_expires_at < now)
+    
+    // CRITICAL: Log token generation decision for pending -> pending_deposit transitions
+    if (isPendingToPendingDeposit) {
+      console.log(`[updateBookingStatus] pending -> pending_deposit: needsNewToken=${needsNewToken}, hasExistingToken=${!!currentBooking.response_token}, tokenExpired=${currentBooking.token_expires_at ? currentBooking.token_expires_at < now : 'N/A'}`)
+    }
     
     // Prevent rapid token regeneration: if token was recently generated and status hasn't changed, preserve it
     if (tokenRecentlyGenerated && oldStatus === finalStatus && currentBooking.response_token && currentBooking.token_expires_at && currentBooking.token_expires_at > now) {
@@ -1433,6 +1430,10 @@ export async function updateBookingStatus(
     } 
     else if (needsNewToken && (finalStatus === "pending_deposit" || finalStatus === "pending" || finalStatus === "paid_deposit")) {
       // Generate new token with collision handling
+      // CRITICAL: For pending -> pending_deposit, this MUST generate a token
+      if (isPendingToPendingDeposit) {
+        console.log(`[updateBookingStatus] Generating new token for pending -> pending_deposit transition (booking ${bookingId})`)
+      }
       responseToken = await generateUniqueResponseToken(db)
       updateFields.push("response_token = ?")
       updateArgs.push(responseToken)
@@ -1701,12 +1702,58 @@ export async function updateBookingStatus(
     }
 
     // Fetch updated booking
+    // CRITICAL: Ensure we get the latest data including any newly generated tokens
     const result = await db.execute({
       sql: "SELECT * FROM bookings WHERE id = ?",
       args: [bookingId],
     })
 
+    if (result.rows.length === 0) {
+      throw new Error(`Booking ${bookingId} not found after update`)
+    }
+
     const updatedBooking = formatBooking(result.rows[0] as any)
+    
+    // CRITICAL: Verify token is present for pending_deposit status
+    // For transitions that require a token (pending -> pending_deposit, cancelled -> pending_deposit),
+    // throw an error if token is missing to ensure transaction rollback
+    const requiresToken = (finalStatus === "pending_deposit" && oldStatus === "pending") ||
+                          (finalStatus === "pending_deposit" && oldStatus === "cancelled")
+    
+    if (requiresToken && !updatedBooking.responseToken) {
+      const errorDetails = {
+        bookingId,
+        oldStatus,
+        finalStatus,
+        wasTokenGenerated: !!responseToken,
+        generatedToken: responseToken || '(null)',
+        dbToken: (result.rows[0] as any).response_token || '(null)',
+        updateFields: updateFields.filter(f => f.includes('response_token')),
+        needsNewToken: true,
+      }
+      console.error(`[updateBookingStatus] CRITICAL: Token missing for pending_deposit booking ${bookingId}`, errorDetails)
+      
+      // CRITICAL: Throw error to cause transaction rollback
+      // This ensures the booking status is not updated if token generation failed
+      throw new Error(
+        `Failed to generate deposit upload token for booking ${bookingId}. ` +
+        `Token generation is required for ${oldStatus} -> ${finalStatus} transition. ` +
+        `This error will cause the transaction to roll back, preventing invalid state.`
+      )
+    }
+    
+    // Log warning (non-critical) for other cases where token might be missing
+    // This handles edge cases but doesn't require transaction rollback
+    if (finalStatus === "pending_deposit" && !updatedBooking.responseToken && !requiresToken) {
+      console.warn(`[updateBookingStatus] Token missing for pending_deposit booking ${bookingId} (non-critical)`, {
+        bookingId,
+        oldStatus,
+        finalStatus,
+        wasTokenGenerated: !!responseToken,
+        generatedToken: responseToken || '(null)',
+        dbToken: (result.rows[0] as any).response_token || '(null)',
+      })
+    }
     
     // Invalidate cache for this booking
     await invalidateCache(CacheKeys.booking(bookingId))
@@ -1759,12 +1806,14 @@ export async function getBookingStatusHistory(
 
 /**
  * Update booking fee
- * Handles fee recording and updates with conversion rate tracking
+ * Handles fee recording, updates, and clearing with conversion rate tracking
+ * 
+ * To clear a fee, pass null for feeAmountOriginal and feeCurrency
  */
 export async function updateBookingFee(
   bookingId: string,
-  feeAmountOriginal: number,
-  feeCurrency: string,
+  feeAmountOriginal: number | null,
+  feeCurrency: string | null,
   options?: {
     feeConversionRate?: number | null
     feeAmount?: number | null
@@ -1791,25 +1840,128 @@ export async function updateBookingFee(
     }
 
     const currentBooking = currentResult.rows[0] as any
+    const currentFeeAmount = currentBooking.fee_amount != null ? Number(currentBooking.fee_amount) : null
     
-    // Validate status allows fee recording/updating
+    // Validate status allows fee recording/updating/clearing
     const validation = validateFee(
       feeAmountOriginal,
       feeCurrency,
       options?.feeConversionRate ?? null,
       options?.feeAmount ?? null,
-      currentBooking.status
+      currentBooking.status,
+      currentFeeAmount
     )
     
     if (!validation.valid) {
       throw new Error(validation.reason || "Fee validation failed")
     }
 
+    const now = getBangkokTime()
+    
+    // Handle fee clearing (null feeAmountOriginal)
+    if (feeAmountOriginal === null || feeAmountOriginal === undefined) {
+      // Clear all fee fields
+      const updateFields: string[] = ["updated_at = ?"]
+      const updateArgs: any[] = [now]
+      
+      updateFields.push("fee_amount = NULL")
+      updateFields.push("fee_amount_original = NULL")
+      updateFields.push("fee_currency = NULL")
+      updateFields.push("fee_conversion_rate = NULL")
+      updateFields.push("fee_rate_date = NULL")
+      updateFields.push("fee_recorded_at = NULL")
+      updateFields.push("fee_recorded_by = NULL")
+      
+      if (options?.feeNotes !== undefined) {
+        updateFields.push("fee_notes = ?")
+        updateArgs.push(options.feeNotes || null)
+      } else {
+        updateFields.push("fee_notes = NULL")
+      }
+      
+      // Validate field names
+      const { validateFieldNames, ALLOWED_BOOKING_FIELDS } = await import('./sql-field-validation')
+      const fieldValidation = validateFieldNames(updateFields, ALLOWED_BOOKING_FIELDS)
+      
+      if (!fieldValidation.valid) {
+        throw new Error(
+          `Invalid field names in update: ${fieldValidation.errors?.join(', ')}`
+        )
+      }
+      
+      // Update booking
+      const originalUpdatedAt = currentBooking.updated_at
+      const updateResult = await db.execute({
+        sql: `UPDATE bookings SET ${updateFields.join(", ")} WHERE id = ? AND updated_at = ?`,
+        args: [...updateArgs, bookingId, originalUpdatedAt],
+      })
+      
+      if (updateResult.rowsAffected === 0) {
+        throw new Error(
+          "Booking was modified by another process. Please refresh the page and try again."
+        )
+      }
+      
+      // Record in fee history (clearing fee)
+      const historyId = randomUUID()
+      await db.execute({
+        sql: `
+          INSERT INTO booking_fee_history (
+            id, booking_id,
+            old_fee_amount, old_fee_amount_original, old_fee_currency,
+            old_fee_conversion_rate, old_fee_rate_date, old_fee_notes,
+            new_fee_amount, new_fee_amount_original, new_fee_currency,
+            new_fee_conversion_rate, new_fee_rate_date, new_fee_notes,
+            changed_by, change_reason, booking_status_at_change, is_restoration_change, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: [
+          historyId,
+          bookingId,
+          currentFeeAmount,
+          currentBooking.fee_amount_original != null ? Number(currentBooking.fee_amount_original) : null,
+          currentBooking.fee_currency || null,
+          currentBooking.fee_conversion_rate != null ? Number(currentBooking.fee_conversion_rate) : null,
+          currentBooking.fee_rate_date || null,
+          currentBooking.fee_notes || null,
+          null, // new_fee_amount
+          null, // new_fee_amount_original
+          null, // new_fee_currency
+          null, // new_fee_conversion_rate
+          null, // new_fee_rate_date
+          options?.feeNotes || null, // new_fee_notes
+          options?.changedBy || "Admin",
+          options?.changeReason || "Fee cleared",
+          currentBooking.status,
+          options?.isRestorationChange ? 1 : 0,
+          now,
+        ],
+      })
+      
+      // Fetch updated booking
+      const result = await db.execute({
+        sql: "SELECT * FROM bookings WHERE id = ?",
+        args: [bookingId],
+      })
+      
+      const updatedBooking = formatBooking(result.rows[0] as any)
+      
+      // Invalidate cache
+      await invalidateCache(CacheKeys.booking(bookingId))
+      await invalidateCache('bookings:list')
+      
+      return updatedBooking
+    }
+    
+    // Handle fee recording/updating (non-null feeAmountOriginal)
+    if (!feeCurrency) {
+      throw new Error("feeCurrency is required when recording or updating a fee")
+    }
+    
     // Calculate missing values
     let finalFeeAmount: number
     let finalConversionRate: number | null = null
     let finalRateDate: number | null = null
-    const now = getBangkokTime()
     const currencyUpper = feeCurrency.toUpperCase()
     
     if (currencyUpper === "THB") {

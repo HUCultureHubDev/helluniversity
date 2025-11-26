@@ -1,4 +1,4 @@
-import { getTursoClient } from "./turso"
+import { getTursoClient, dbTransaction } from "./turso"
 import { randomUUID } from "crypto"
 import nodemailer from "nodemailer"
 import { getTransporter } from "./email"
@@ -49,36 +49,82 @@ export async function addEmailToQueue(
   
   // IMPROVED: Check for duplicate emails before adding to queue
   // Prevents duplicate emails for same booking/status change within 5 minutes
+  // FIXED: Use JSON extraction instead of LIKE pattern matching to prevent false positives/negatives
   if (!options?.skipDuplicateCheck && metadata?.bookingId) {
     try {
-      // IMPROVED: Escape special LIKE characters in bookingId to prevent pattern matching issues
-      // While bookingId is typically a UUID (safe), this provides defense-in-depth
-      // Escape % and _ characters that have special meaning in LIKE patterns
-      const escapedBookingId = String(metadata.bookingId).replace(/%/g, '\\%').replace(/_/g, '\\_')
+      // FIXED: Use JSON extraction to safely check for bookingId in metadata
+      // This is more reliable than LIKE pattern matching and prevents false matches
+      const bookingIdStr = String(metadata.bookingId)
       
+      // For SQLite, we need to use JSON_EXTRACT or parse JSON manually
+      // Since SQLite JSON support varies, we'll fetch recent emails and parse in code
       const duplicateCheck = await db.execute({
         sql: `
-          SELECT id FROM email_queue 
+          SELECT id, metadata FROM email_queue 
           WHERE email_type = ? 
             AND recipient_email = ? 
-            AND metadata LIKE ?
             AND created_at > ?
             AND status IN ('pending', 'processing')
           ORDER BY created_at DESC
-          LIMIT 1
+          LIMIT 50
         `,
         args: [
           emailType,
           recipientEmail,
-          `%"bookingId":"${escapedBookingId}"%`,
           now - 300 // 5 minutes
         ],
       })
       
-      if (duplicateCheck.rows.length > 0) {
-        const existingId = (duplicateCheck.rows[0] as any).id
-        console.log(`Duplicate email detected, returning existing queue item: ${existingId} (${emailType} to ${recipientEmail} for booking ${metadata.bookingId})`)
-        return existingId
+      // Parse metadata and check for matching bookingId
+      for (const row of duplicateCheck.rows) {
+        const item = row as any
+        if (!item.metadata) continue
+        
+        try {
+          const parsedMetadata = typeof item.metadata === 'string' 
+            ? JSON.parse(item.metadata) 
+            : item.metadata
+          
+          // Check if bookingId matches
+          if (parsedMetadata.bookingId === bookingIdStr) {
+            // For status_change emails, always check status (even if missing in new metadata)
+            // This prevents different status transitions from being treated as duplicates
+            if (emailType === 'status_change') {
+              // Both must have status and they must match, OR both must be missing status
+              const existingStatus = parsedMetadata.status
+              const newStatus = metadata.status
+              
+              // If both have status, they must match to be considered duplicate
+              if (existingStatus !== undefined && newStatus !== undefined) {
+                if (existingStatus === newStatus) {
+                  const existingId = item.id
+                  console.log(`Duplicate email detected, returning existing queue item: ${existingId} (${emailType} to ${recipientEmail} for booking ${bookingIdStr}, status: ${newStatus})`)
+                  return existingId
+                }
+                // Different statuses - not a duplicate, continue searching
+                continue
+              }
+              
+              // If one has status and the other doesn't, they're different transitions - not duplicates
+              if ((existingStatus !== undefined) !== (newStatus !== undefined)) {
+                continue
+              }
+              
+              // Both missing status - treat as duplicate (legacy behavior, but should be rare)
+              const existingId = item.id
+              console.log(`Duplicate email detected (both missing status), returning existing queue item: ${existingId} (${emailType} to ${recipientEmail} for booking ${bookingIdStr})`)
+              return existingId
+            } else {
+              // For non-status emails, just check bookingId
+              const existingId = item.id
+              console.log(`Duplicate email detected, returning existing queue item: ${existingId} (${emailType} to ${recipientEmail} for booking ${bookingIdStr})`)
+              return existingId
+            }
+          }
+        } catch (parseError) {
+          // Skip items with invalid JSON metadata
+          continue
+        }
       }
     } catch (error) {
       // If duplicate check fails, log but continue (don't block email queuing)
@@ -205,13 +251,16 @@ export async function getPendingCriticalStatusEmails(limit: number = 20): Promis
     // Don't throw - cleanup failure shouldn't block email processing
   })
 
-  // Get all pending status_change emails
+  // CRITICAL: Process all critical email types:
+  // 1. status_change emails with critical statuses (pending_deposit, confirmed, cancelled)
+  // 2. user_confirmation emails (user booking confirmation - must be sent)
+  // 3. admin_notification emails (admin booking notification - must be sent)
   // Optimized: Uses idx_email_queue_critical (status, email_type, created_at) index
   const result = await db.execute({
     sql: `
       SELECT * FROM email_queue
       WHERE status = 'pending'
-        AND email_type = 'status_change'
+        AND email_type IN ('status_change', 'user_confirmation', 'admin_notification')
         AND (next_retry_at IS NULL OR next_retry_at <= ?)
         AND retry_count < max_retries
       ORDER BY created_at ASC
@@ -220,36 +269,51 @@ export async function getPendingCriticalStatusEmails(limit: number = 20): Promis
     args: [now, limit * 2], // Get more to filter by metadata
   })
 
-  // Filter to only include emails with critical statuses in metadata
+  // Filter emails based on type
   // Critical statuses: pending_deposit, confirmed, cancelled
   const criticalEmails: EmailQueueItem[] = []
   
   for (const row of result.rows) {
     const email = formatEmailQueueItem(row)
     
-    // Parse metadata to check status
-    let metadata: any = {}
-    if (email.metadata) {
-      if (typeof email.metadata === 'string') {
-        try {
-          metadata = JSON.parse(email.metadata)
-        } catch {
-          // Skip if metadata can't be parsed
-          continue
-        }
-      } else {
-        metadata = email.metadata
-      }
-    }
-    
-    // Only include if status is one of the critical statuses
-    const criticalStatuses = ['pending_deposit', 'confirmed', 'cancelled']
-    if (criticalStatuses.includes(metadata.status)) {
+    // CRITICAL: Always include user_confirmation and admin_notification emails
+    // These are essential for booking creation and must be sent
+    if (email.emailType === 'user_confirmation' || email.emailType === 'admin_notification') {
       criticalEmails.push(email)
       
       // Stop when we reach the limit
       if (criticalEmails.length >= limit) {
         break
+      }
+      continue
+    }
+    
+    // For status_change emails, check metadata for critical statuses
+    if (email.emailType === 'status_change') {
+      // Parse metadata to check status
+      let metadata: any = {}
+      if (email.metadata) {
+        if (typeof email.metadata === 'string') {
+          try {
+            metadata = JSON.parse(email.metadata)
+          } catch {
+            // Skip if metadata can't be parsed
+            continue
+          }
+        } else {
+          metadata = email.metadata
+        }
+      }
+      
+      // Only include if status is one of the critical statuses
+      const criticalStatuses = ['pending_deposit', 'confirmed', 'cancelled']
+      if (criticalStatuses.includes(metadata.status)) {
+        criticalEmails.push(email)
+        
+        // Stop when we reach the limit
+        if (criticalEmails.length >= limit) {
+          break
+        }
       }
     }
   }
@@ -300,6 +364,71 @@ export async function markEmailProcessing(id: string): Promise<boolean> {
   // If rowsAffected > 0, we successfully claimed the email
   // If rowsAffected = 0, another process already claimed it
   return (result.rowsAffected || 0) > 0
+}
+
+/**
+ * Atomically select and claim pending emails
+ * This eliminates the race condition between getPendingEmails and markEmailProcessing
+ * Returns emails that were successfully claimed by this process
+ */
+export async function atomicallyClaimPendingEmails(limit: number = 10): Promise<EmailQueueItem[]> {
+  const db = getTursoClient()
+  const now = Math.floor(Date.now() / 1000)
+
+  // CRITICAL: Use a transaction to atomically select and claim emails
+  // This prevents multiple processes from selecting the same emails
+  return await dbTransaction(async (tx) => {
+    // Step 1: Select pending emails
+    // Note: SQLite doesn't support FOR UPDATE, so we use a transaction to ensure atomicity
+    const selectResult = await tx.execute({
+      sql: `
+        SELECT * FROM email_queue
+        WHERE status = 'pending'
+          AND (next_retry_at IS NULL OR next_retry_at <= ?)
+          AND retry_count < max_retries
+        ORDER BY 
+          CASE 
+            WHEN email_type IN ('status_change', 'user_confirmation', 'admin_notification') THEN 1
+            ELSE 2
+          END,
+          created_at ASC
+        LIMIT ?
+      `,
+      args: [now, limit],
+    })
+
+    if (selectResult.rows.length === 0) {
+      return []
+    }
+
+    // Step 2: Extract IDs and claim them atomically
+    const ids = selectResult.rows.map(row => (row as any).id)
+    
+    // Step 3: Atomically claim all selected emails in one UPDATE
+    // Only update emails that are still 'pending' (handles race condition)
+    const placeholders = ids.map(() => '?').join(',')
+    await tx.execute({
+      sql: `
+        UPDATE email_queue
+        SET status = 'processing', updated_at = ?
+        WHERE id IN (${placeholders}) AND status = 'pending'
+      `,
+      args: [now, ...ids],
+    })
+
+    // Step 4: Return only emails that were successfully claimed
+    // Query again to get only emails that are now in 'processing' status with current timestamp
+    const claimedResult = await tx.execute({
+      sql: `
+        SELECT * FROM email_queue
+        WHERE id IN (${placeholders}) AND status = 'processing' AND updated_at = ?
+      `,
+      args: [...ids, now],
+    })
+
+    // Convert to EmailQueueItem format using existing helper
+    return claimedResult.rows.map((row: any) => formatEmailQueueItem(row))
+  })
 }
 
 /**
@@ -449,7 +578,9 @@ export async function processEmailQueue(limit: number = 10): Promise<{
     }
   }
   
-  const pendingEmails = await getPendingEmails(effectiveLimit)
+  // CRITICAL: Use atomic claim to eliminate race condition
+  // This selects and claims emails in one atomic operation
+  const pendingEmails = await atomicallyClaimPendingEmails(effectiveLimit)
   const results = {
     processed: 0,
     sent: 0,
@@ -470,15 +601,8 @@ export async function processEmailQueue(limit: number = 10): Promise<{
     }
     
     try {
-      // ATOMIC CLAIM: Try to claim email atomically
-      // If another process already claimed it, skip this email
-      const claimed = await markEmailProcessing(email.id)
-      if (!claimed) {
-        // Another process already claimed this email, skip it
-        console.log(`Email ${email.id} already claimed by another process, skipping`)
-        continue
-      }
-      
+      // CRITICAL: Email is already claimed atomically by atomicallyClaimPendingEmails
+      // No need to claim again - it's already in 'processing' status
       results.processed++
 
       // Send email
@@ -586,7 +710,7 @@ export async function processCriticalStatusEmails(limit: number = 20): Promise<{
     errors: [] as string[],
   }
 
-  console.log(`Processing ${pendingEmails.length} critical status change emails (pending_deposit/confirmed/cancelled)`)
+  console.log(`Processing ${pendingEmails.length} critical emails (status changes, user confirmations, admin notifications)`)
 
   for (const email of pendingEmails) {
     try {
@@ -622,7 +746,14 @@ export async function processCriticalStatusEmails(limit: number = 20): Promise<{
       await markEmailSent(email.id)
       results.sent++
       
-      console.log(`Critical status email ${email.id} sent successfully: ${result.messageId} (Status: ${metadata.status})`)
+      // Log based on email type
+      if (email.emailType === 'user_confirmation') {
+        console.log(`User confirmation email ${email.id} sent successfully: ${result.messageId}`)
+      } else if (email.emailType === 'admin_notification') {
+        console.log(`Admin notification email ${email.id} sent successfully: ${result.messageId}`)
+      } else {
+        console.log(`Critical status email ${email.id} sent successfully: ${result.messageId} (Status: ${metadata.status || 'N/A'})`)
+      }
     } catch (error) {
       // IMPROVED: Safely extract and sanitize error message
       // Removes sensitive information before logging/queuing
@@ -655,9 +786,9 @@ export async function processCriticalStatusEmails(limit: number = 20): Promise<{
       
       if (email.retryCount + 1 >= email.maxRetries) {
         results.failed++
-        console.error(`Critical status email ${email.id} failed after ${email.retryCount + 1} retries`)
+        console.error(`${email.emailType} email ${email.id} failed after ${email.retryCount + 1} retries`)
       } else {
-        console.error(`Critical status email ${email.id} failed, scheduled for retry: ${errorMessage}`)
+        console.error(`${email.emailType} email ${email.id} failed, scheduled for retry: ${errorMessage}`)
       }
     }
   }
@@ -854,21 +985,22 @@ export async function deleteEmail(id: string): Promise<void> {
 }
 
 /**
- * Cleanup old sent emails (older than specified days)
+ * Cleanup all sent emails (removes all emails with status 'sent')
+ * 
+ * NOTE: This function deletes ALL sent emails, not just old ones.
+ * If you need to delete only emails older than a certain threshold,
+ * modify the SQL query to add a date filter.
  */
-export async function cleanupOldSentEmails(daysOld: number = 30): Promise<number> {
+export async function cleanupAllSentEmails(): Promise<number> {
   const db = getTursoClient()
-  const now = Math.floor(Date.now() / 1000)
-  const cutoffTime = now - (daysOld * 24 * 60 * 60)
   
   const result = await db.execute({
     sql: `
       DELETE FROM email_queue
       WHERE status = 'sent'
         AND sent_at IS NOT NULL
-        AND sent_at < ?
     `,
-    args: [cutoffTime],
+    args: [],
   })
   
   return result.rowsAffected || 0

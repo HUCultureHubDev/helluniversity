@@ -21,6 +21,7 @@ import PhoneInput from "react-phone-number-input"
 import { TimePicker } from "@/components/ui/time-picker"
 import { dateToBangkokDateString } from "@/lib/timezone-client"
 import { API_PATHS, buildApiUrl } from "@/lib/api-config"
+import { useBookingEnabledSSE } from "@/hooks/useBookingEnabledSSE"
 
 const STORAGE_KEY = "helluniversity_booking_form"
 const DEBOUNCE_DELAY = 500 // milliseconds
@@ -69,7 +70,11 @@ interface FormError {
   retryable?: boolean
 }
 
-export function Header() {
+interface HeaderProps {
+  initialBookingEnabled?: boolean
+}
+
+export function Header({ initialBookingEnabled }: HeaderProps = {}) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const headerRef = useRef<HTMLElement | null>(null)
   const [mounted, setMounted] = useState(false)
@@ -78,6 +83,8 @@ export function Header() {
   const [endDate, setEndDate] = useState<Date>()
   const [recaptchaToken, setRecaptchaToken] = useState<string | null>(null)
   const [isRecaptchaVerified, setIsRecaptchaVerified] = useState(false)
+  const [showRecaptcha, setShowRecaptcha] = useState(false)
+  const recaptchaShownAtRef = useRef<number | null>(null) // Track when reCAPTCHA overlay was shown
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [formData, setFormData] = useState<FormData>({
     name: "",
@@ -100,6 +107,9 @@ export function Header() {
   const [retryCount, setRetryCount] = useState(0)
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const recaptchaKeyRef = useRef(0) // Force reCAPTCHA re-render
+  const isSubmittingRef = useRef(false) // Synchronous guard against duplicate submissions
+  const abortControllerRef = useRef<AbortController | null>(null) // Store AbortController to allow cancellation from reCAPTCHA expire handler
+  const wasAbortedByRecaptchaExpireRef = useRef(false) // Track if abort was due to reCAPTCHA expiration
   const [unavailableDates, setUnavailableDates] = useState<Set<string>>(new Set())
   const [unavailableTimeRanges, setUnavailableTimeRanges] = useState<Array<{
     date: string
@@ -108,8 +118,6 @@ export function Header() {
     startDate: number
     endDate: number
   }>>([])
-  const [bookingsEnabled, setBookingsEnabled] = useState<boolean>(false) // Start as false to prevent flash
-  const [bookingStatusLoaded, setBookingStatusLoaded] = useState<boolean>(false) // Track if status has been fetched
   const [calendarMonth, setCalendarMonth] = useState<Date>(new Date())
 
   // Ensure component is mounted (client-side only)
@@ -117,48 +125,44 @@ export function Header() {
     setMounted(true)
   }, [])
 
-  // Fetch booking enabled status and poll for changes
-  useEffect(() => {
-    async function fetchBookingStatus() {
-      try {
-        const response = await fetch(API_PATHS.settingsBookingEnabled)
-        const json = await response.json()
-        
-        if (json.success && json.data) {
-          const newStatus = json.data.enabled
-          setBookingsEnabled(newStatus)
-          setBookingStatusLoaded(true) // Mark as loaded after first fetch
-          
-          // If bookings are disabled while dialog is open, close the dialog
-          if (!newStatus && bookingOpen) {
-            setBookingOpen(false)
-            toast.error("Bookings are currently disabled. Please try again later.")
-          }
-        } else {
-          // If API call succeeds but no data, default to disabled
-          setBookingsEnabled(false)
-          setBookingStatusLoaded(true)
-        }
-      } catch (error) {
-        console.error("Failed to fetch booking status:", error)
-        // On error, default to disabled (safer than showing button when it shouldn't be)
-        setBookingsEnabled(false)
-        setBookingStatusLoaded(true)
+  // Use SSE hook for real-time booking enabled status updates
+  // This replaces the previous polling mechanism with Server-Sent Events
+  const {
+    enabled: bookingsEnabled,
+    loaded: bookingStatusLoaded,
+    connected: sseConnected,
+  } = useBookingEnabledSSE({
+    initialStatus: initialBookingEnabled,
+    showNotifications: true,
+    onStatusChange: useCallback((newEnabled: boolean, previousEnabled: boolean) => {
+      // If status changed from enabled to disabled, close dialog immediately
+      // Note: onStatusChange is only called when previousEnabled !== newEnabled,
+      // so this condition covers the transition from enabled to disabled
+      if (previousEnabled && !newEnabled && bookingOpen) {
+        // Reset reCAPTCHA overlay state when closing dialog
+        setShowRecaptcha(false)
+        setRecaptchaToken(null)
+        setIsRecaptchaVerified(false)
+        recaptchaShownAtRef.current = null
+        setBookingOpen(false)
       }
-    }
+      // Note: The else if (!newEnabled && bookingOpen) condition was unreachable
+      // because onStatusChange is only invoked when status changes (previousEnabled !== newEnabled).
+      // If previousEnabled is false and newEnabled is false, no change occurred, so the callback
+      // wouldn't be called. This redundant condition has been removed.
+    }, [bookingOpen]),
+    onDisabled: useCallback(() => {
+      if (bookingOpen) {
+        // Reset reCAPTCHA overlay state when closing dialog
+        setShowRecaptcha(false)
+        setRecaptchaToken(null)
+        setIsRecaptchaVerified(false)
+        recaptchaShownAtRef.current = null
+        setBookingOpen(false)
+      }
+    }, [bookingOpen]),
+  })
 
-    if (mounted) {
-      // Fetch immediately
-      fetchBookingStatus()
-      
-      // Poll every 30 seconds to check for status changes
-      const pollInterval = setInterval(fetchBookingStatus, 30000)
-      
-      return () => {
-        clearInterval(pollInterval)
-      }
-    }
-  }, [mounted, bookingOpen])
 
   // Fetch unavailable dates when booking dialog opens and refresh periodically
   useEffect(() => {
@@ -363,9 +367,38 @@ export function Header() {
   }
 
   function handleRecaptchaVerify(token: string) {
+    // Guard against re-entry: prevent duplicate submissions if already submitting
+    // Use ref for synchronous check (state updates are async and could miss rapid duplicates)
+    if (isSubmittingRef.current || isSubmitting) {
+      console.warn("Booking submission already in progress, ignoring duplicate reCAPTCHA verification")
+      return
+    }
+    
+    // Check if bookings are still enabled before proceeding with submission
+    // This prevents submission if bookings were disabled via SSE while reCAPTCHA was being verified
+    if (!bookingsEnabled) {
+      console.warn("Bookings are disabled, ignoring reCAPTCHA verification")
+      setRecaptchaToken(null)
+      setIsRecaptchaVerified(false)
+      setShowRecaptcha(false)
+      setError({
+        type: "validation",
+        message: "Bookings are currently disabled. Please try again later.",
+        retryable: false
+      })
+      return
+    }
+    
     setRecaptchaToken(token)
     setIsRecaptchaVerified(true)
     setError(null) // Clear any previous errors
+    // Automatically submit when verified
+    // Use .catch() to handle any unhandled promise rejections
+    executeBookingSubmission(token).catch((error) => {
+      // Error is already handled in executeBookingSubmission's catch block
+      // This catch prevents unhandled promise rejection warnings
+      console.error("Booking submission error in handleRecaptchaVerify:", error)
+    })
   }
 
   function handleRecaptchaError() {
@@ -373,8 +406,17 @@ export function Header() {
     if (isSubmitting || !bookingOpen) {
       return
     }
+    
+    // Prevent error from firing too quickly after showing reCAPTCHA (during initialization)
+    // Give the widget at least 1 second to initialize before showing errors
+    if (recaptchaShownAtRef.current && Date.now() - recaptchaShownAtRef.current < 1000) {
+      console.warn("reCAPTCHA error occurred during initialization, ignoring")
+      return
+    }
+    
     setRecaptchaToken(null)
     setIsRecaptchaVerified(false)
+    setShowRecaptcha(false)
     setError({
       type: "recaptcha",
       message: "CAPTCHA verification failed. Please try again.",
@@ -388,9 +430,21 @@ export function Header() {
     setRecaptchaToken(null)
     setIsRecaptchaVerified(false)
     
-    // If form is submitting, stop the submission and show error
-    if (isSubmitting) {
+    // If form is submitting, abort the request and stop the submission
+    if (isSubmitting || isSubmittingRef.current) {
+      // Mark that abort was intentional (due to reCAPTCHA expiration)
+      wasAbortedByRecaptchaExpireRef.current = true
+      
+      // Abort the ongoing fetch request if it exists
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+        abortControllerRef.current = null
+      }
+      
+      // Reset submission state
+      isSubmittingRef.current = false
       setIsSubmitting(false)
+      setShowRecaptcha(false)
       setError({
         type: "recaptcha",
         message: "CAPTCHA verification expired during submission. Please verify again and resubmit.",
@@ -404,6 +458,8 @@ export function Header() {
       return
     }
     
+    // Close overlay if it's open
+    setShowRecaptcha(false)
     setError({
       type: "recaptcha",
       message: "CAPTCHA verification expired. Please verify again to continue.",
@@ -412,11 +468,39 @@ export function Header() {
   }
 
   // Reset reCAPTCHA when modal opens (but preserve form data)
-  const handleBookingOpenChange = (open: boolean) => {
+  const handleBookingOpenChange = async (open: boolean) => {
     // Prevent closing the modal when submitting
     if (!open && isSubmitting) {
       return
     }
+    
+    // If opening the modal, verify bookings are still enabled
+    if (open) {
+      try {
+        const response = await fetch(API_PATHS.settingsBookingEnabled)
+        const json = await response.json()
+        
+        if (json.success && json.data) {
+          const currentStatus = json.data.enabled
+          
+          // If bookings are disabled, don't open the modal
+          if (!currentStatus) {
+            toast.error("Bookings are currently disabled. Please try again later.")
+            return
+          }
+        } else {
+          // If we can't verify, assume disabled for safety
+          toast.error("Unable to verify booking status. Please try again later.")
+          return
+        }
+      } catch (error) {
+        console.error("Failed to verify booking status before opening:", error)
+        // On error, assume disabled for safety
+        toast.error("Unable to verify booking status. Please try again later.")
+        return
+      }
+    }
+    
     setBookingOpen(open)
     
     // Notify breadcrumb component when booking dialog state changes
@@ -426,6 +510,8 @@ export function Header() {
       // Modal opened - reset captcha verification but keep form data
       setRecaptchaToken(null)
       setIsRecaptchaVerified(false)
+      setShowRecaptcha(false)
+      recaptchaShownAtRef.current = null
       setError(null)
       setRetryCount(0)
       // Force reCAPTCHA to re-render by incrementing key
@@ -438,201 +524,49 @@ export function Header() {
     }
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setError(null)
-    
-    // Check if bookings are enabled before allowing submission
-    if (!bookingsEnabled) {
-      setError({
-        type: "validation",
-        message: "Bookings are currently disabled. Please try again later.",
-        retryable: false
-      })
-      setBookingOpen(false)
+  const executeBookingSubmission = async (token: string) => {
+    // Synchronous guard: prevent duplicate submissions even if state hasn't updated yet
+    if (isSubmittingRef.current) {
+      console.warn("Booking submission already in progress, ignoring duplicate submission attempt")
       return
     }
     
-    // Check if we're in static export mode (GitHub Pages)
-    const isStaticMode = process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'
+    // Set both state and ref immediately for synchronous and asynchronous protection
+    isSubmittingRef.current = true
+    setIsSubmitting(true)
+    setShowRecaptcha(false) // Hide overlay while submitting
     
-    if (isStaticMode) {
-      // In static mode, API routes don't work - show helpful message
-      setError({
-        type: "static",
-        message: "Reservation form is not available on this static site. Please contact us directly via email or phone.",
-        retryable: false
-      })
-      return
-    }
-    
-    // Validate reCAPTCHA
-    if (!isRecaptchaVerified || !recaptchaToken) {
-      setError({
-        type: "recaptcha",
-        message: "Please complete the CAPTCHA verification first.",
-        retryable: false
-      })
-      return
-    }
-    
-    // Track form completion attempt (funnel step 3) - before validation
-    const eventType = formData.eventType === "Other" ? formData.otherEventType : formData.eventType
-    const hasAllRequiredFields = !!(
-      formData.name &&
-      formData.email &&
-      formData.phone &&
-      formData.eventType &&
-      startDate &&
-      formData.startTime &&
-      formData.endTime
-    )
-    trackBookingFormCompletionAttempt(eventType || 'unknown', hasAllRequiredFields)
-    
-    // Validate required fields
-    if (!startDate) {
-      setError({
-        type: "validation",
-        message: "Please select a start date.",
-        retryable: false
-      })
-      return
-    }
-    if (formData.dateRange && !endDate) {
-      setError({
-        type: "validation",
-        message: "Please select an end date for the date range.",
-        retryable: false
-      })
-      return
-    }
-    // Validate that start and end dates are not the same when dateRange is true
-    // Use Bangkok timezone for consistent date comparison
-    if (formData.dateRange && startDate && endDate) {
-      const startDateStr = dateToBangkokDateString(startDate)
-      const endDateStr = dateToBangkokDateString(endDate)
-      if (startDateStr === endDateStr) {
-        setError({
-          type: "validation",
-          message: "End date cannot be the same as start date. Please select a different end date.",
-          retryable: false
-        })
-        return
-      }
-    }
-    if (!formData.startTime) {
-      setError({
-        type: "validation",
-        message: "Please select a start time.",
-        retryable: false
-      })
-      return
-    }
-    if (!formData.endTime) {
-      setError({
-        type: "validation",
-        message: "Please select an end time.",
-        retryable: false
-      })
-      return
-    }
-    
-    // Validate single day booking: end time must be after start time
-    // For multiple day bookings, times are on different days so we don't compare them
-    if (!formData.dateRange && formData.startTime && formData.endTime) {
-      const parseTime = (time: string): number => {
-        if (!time || !time.includes(':')) return 0
-        const [hours, minutes] = time.split(':').map(Number)
-        return (hours || 0) * 60 + (minutes || 0) // Convert to minutes for comparison
-      }
-      
-      const startMinutes = parseTime(formData.startTime.trim())
-      const endMinutes = parseTime(formData.endTime.trim())
-      
-      if (endMinutes <= startMinutes) {
-        setError({
-          type: "validation",
-          message: "For single day bookings, the end time must be after the start time. Please select a later end time.",
-          retryable: false
-        })
-        return
-      }
-    }
-    
-    if (!formData.participants || parseInt(formData.participants) <= 0) {
-      setError({
-        type: "validation",
-        message: "Please enter the number of participants (must be greater than 0).",
-        retryable: false
-      })
-      return
-    }
-    if (!formData.eventType) {
-      setError({
-        type: "validation",
-        message: "Please select an event type.",
-        retryable: false
-      })
-      return
-    }
-    if (formData.eventType === "Other" && !formData.otherEventType.trim()) {
-      setError({
-        type: "validation",
-        message: "Please specify the event type.",
-        retryable: false
-      })
-      return
-    }
-    if (!formData.organizationType) {
-      setError({
-        type: "validation",
-        message: "Please select an organization type.",
-        retryable: false
-      })
-      return
-    }
-    
-    // Double-check bookings are still enabled right before API call
-    // This prevents race conditions where status changes between form submission and API call
     try {
-      const statusCheck = await fetch(API_PATHS.settingsBookingEnabled)
-      const statusJson = await statusCheck.json()
+      // Reset abort flag at start of submission
+      wasAbortedByRecaptchaExpireRef.current = false
       
-      if (statusJson.success && statusJson.data && !statusJson.data.enabled) {
-        setBookingsEnabled(false)
+      const controller = new AbortController()
+      // Store controller in ref so it can be accessed by handleRecaptchaExpire
+      abortControllerRef.current = controller
+      const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
+
+      // Verify bookings are still enabled before sending the request
+      // This provides client-side validation if bookings were disabled via SSE between
+      // reCAPTCHA verification and actual submission
+      if (!bookingsEnabled) {
+        // Clean up timeout and controller before returning
+        clearTimeout(timeoutId)
+        abortControllerRef.current = null
+        // Reset submission state
+        isSubmittingRef.current = false
+        setIsSubmitting(false)
+        setShowRecaptcha(false)
         setError({
           type: "validation",
           message: "Bookings are currently disabled. Please try again later.",
           retryable: false
         })
-        setBookingOpen(false)
         return
       }
-    } catch (statusError) {
-      // If status check fails, proceed with submission (API will handle it)
-      console.warn("Failed to verify booking status before submission:", statusError)
-    }
-    
-    // CRITICAL: Final captcha validation check right before submission
-    // This prevents race condition where captcha expires between initial check and API call
-    if (!isRecaptchaVerified || !recaptchaToken) {
-      setError({
-        type: "recaptcha",
-        message: "CAPTCHA verification expired. Please verify again to continue.",
-        retryable: true
-      })
-      return
-    }
-    
-    setIsSubmitting(true)
-    
-    try {
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
-
+      
       // Prepare booking data - ensure all fields are properly formatted
       const bookingPayload = {
-        token: recaptchaToken,
+        token: token,
         name: formData.name.trim(),
         email: formData.email.trim(),
         phone: formData.phone.trim(),
@@ -880,6 +814,9 @@ export function Header() {
     } catch (error: any) {
       console.error("Booking submission error:", error)
       
+      // CRITICAL: Close the reCAPTCHA overlay so users can see the error message
+      setShowRecaptcha(false)
+      
       // CRITICAL: If error is related to captcha, reset captcha state
       const errorMsg = error?.message || String(error) || ""
       if (errorMsg.toLowerCase().includes('captcha') || 
@@ -904,6 +841,20 @@ export function Header() {
       let retryable = true
 
       if (error.name === "AbortError") {
+        // Check if abort was due to reCAPTCHA expiration (error already set by handleRecaptchaExpire)
+        if (wasAbortedByRecaptchaExpireRef.current) {
+          // Error message was already set by handleRecaptchaExpire, don't overwrite it
+          // Reset reCAPTCHA state and increment key to force fresh render on retry
+          setRecaptchaToken(null)
+          setIsRecaptchaVerified(false)
+          if (recaptchaKeyRef.current !== undefined) {
+            recaptchaKeyRef.current += 1
+          }
+          // Reset the flag and return early
+          wasAbortedByRecaptchaExpireRef.current = false
+          return
+        }
+        // Otherwise, it was a timeout
         errorMessage = "Request timed out. Please check your connection and try again."
         errorType = "network"
         retryable = true
@@ -966,8 +917,202 @@ export function Header() {
         },
       })
     } finally {
+      // Reset both state and ref
+      isSubmittingRef.current = false
       setIsSubmitting(false)
+      // Clear abort controller ref
+      abortControllerRef.current = null
+      // Reset abort flag
+      wasAbortedByRecaptchaExpireRef.current = false
     }
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    
+    // Check if bookings are enabled before allowing submission
+    if (!bookingsEnabled) {
+      setError({
+        type: "validation",
+        message: "Bookings are currently disabled. Please try again later.",
+        retryable: false
+      })
+      setBookingOpen(false)
+      toast.error("Bookings are currently disabled. Please try again later.")
+      return
+    }
+    
+    // Check if we're in static export mode (GitHub Pages)
+    const isStaticMode = process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'
+    
+    if (isStaticMode) {
+      // In static mode, API routes don't work - show helpful message
+      setError({
+        type: "static",
+        message: "Reservation form is not available on this static site. Please contact us directly via email or phone.",
+        retryable: false
+      })
+      return
+    }
+    
+    // Track form completion attempt (funnel step 3) - before validation
+    const eventType = formData.eventType === "Other" ? formData.otherEventType : formData.eventType
+    const hasAllRequiredFields = !!(
+      formData.name &&
+      formData.email &&
+      formData.phone &&
+      formData.eventType &&
+      startDate &&
+      formData.startTime &&
+      formData.endTime
+    )
+    trackBookingFormCompletionAttempt(eventType || 'unknown', hasAllRequiredFields)
+    
+    // Validate required fields
+    if (!startDate) {
+      setError({
+        type: "validation",
+        message: "Please select a start date.",
+        retryable: false
+      })
+      return
+    }
+    if (formData.dateRange && !endDate) {
+      setError({
+        type: "validation",
+        message: "Please select an end date for the date range.",
+        retryable: false
+      })
+      return
+    }
+    // Validate that start and end dates are not the same when dateRange is true
+    // Use Bangkok timezone for consistent date comparison
+    if (formData.dateRange && startDate && endDate) {
+      const startDateStr = dateToBangkokDateString(startDate)
+      const endDateStr = dateToBangkokDateString(endDate)
+      if (startDateStr === endDateStr) {
+        setError({
+          type: "validation",
+          message: "End date cannot be the same as start date. Please select a different end date.",
+          retryable: false
+        })
+        return
+      }
+    }
+    if (!formData.startTime) {
+      setError({
+        type: "validation",
+        message: "Please select a start time.",
+        retryable: false
+      })
+      return
+    }
+    if (!formData.endTime) {
+      setError({
+        type: "validation",
+        message: "Please select an end time.",
+        retryable: false
+      })
+      return
+    }
+    
+    // Validate single day booking: end time must be after start time
+    // For multiple day bookings, times are on different days so we don't compare them
+    if (!formData.dateRange && formData.startTime && formData.endTime) {
+      const parseTime = (time: string): number => {
+        if (!time || !time.includes(':')) return 0
+        const [hours, minutes] = time.split(':').map(Number)
+        return (hours || 0) * 60 + (minutes || 0) // Convert to minutes for comparison
+      }
+      
+      const startMinutes = parseTime(formData.startTime.trim())
+      const endMinutes = parseTime(formData.endTime.trim())
+      
+      if (endMinutes <= startMinutes) {
+        setError({
+          type: "validation",
+          message: "For single day bookings, the end time must be after the start time. Please select a later end time.",
+          retryable: false
+        })
+        return
+      }
+    }
+    
+    if (!formData.participants || parseInt(formData.participants) <= 0) {
+      setError({
+        type: "validation",
+        message: "Please enter the number of participants (must be greater than 0).",
+        retryable: false
+      })
+      return
+    }
+    if (!formData.eventType) {
+      setError({
+        type: "validation",
+        message: "Please select an event type.",
+        retryable: false
+      })
+      return
+    }
+    if (formData.eventType === "Other" && !formData.otherEventType.trim()) {
+      setError({
+        type: "validation",
+        message: "Please specify the event type.",
+        retryable: false
+      })
+      return
+    }
+    if (!formData.organizationType) {
+      setError({
+        type: "validation",
+        message: "Please select an organization type.",
+        retryable: false
+      })
+      return
+    }
+    
+    // Double-check bookings are still enabled right before showing Recaptcha
+    // Note: SSE keeps bookingsEnabled up-to-date, but we do a final check for safety
+    if (!bookingsEnabled) {
+      setError({
+        type: "validation",
+        message: "Bookings are currently disabled. Please try again later.",
+        retryable: false
+      })
+      setBookingOpen(false)
+      return
+    }
+    
+    // Additional verification via API call for extra safety
+    try {
+      const statusCheck = await fetch(API_PATHS.settingsBookingEnabled)
+      const statusJson = await statusCheck.json()
+      
+      if (statusJson.success && statusJson.data && !statusJson.data.enabled) {
+        setError({
+          type: "validation",
+          message: "Bookings are currently disabled. Please try again later.",
+          retryable: false
+        })
+        setBookingOpen(false)
+        return
+      }
+    } catch (statusError) {
+      // If status check fails, proceed 
+      console.warn("Failed to verify booking status before submission:", statusError)
+    }
+    
+    // Show reCAPTCHA overlay for verification
+    // Reset reCAPTCHA state to ensure clean state for new verification attempt
+    // This prevents stale state from previous attempts and matches handleBookingOpenChange behavior
+    setRecaptchaToken(null)
+    setIsRecaptchaVerified(false)
+    // Reset reCAPTCHA key to force fresh component state on retry
+    recaptchaKeyRef.current += 1
+    // Track when we show the reCAPTCHA to prevent premature error handling
+    recaptchaShownAtRef.current = Date.now()
+    setShowRecaptcha(true)
   }
 
   // Retry submission handler
@@ -978,6 +1123,7 @@ export function Header() {
       // Reset captcha to force re-verification
       setRecaptchaToken(null)
       setIsRecaptchaVerified(false)
+      recaptchaShownAtRef.current = null
       recaptchaKeyRef.current += 1
     }
   }
@@ -1003,7 +1149,10 @@ export function Header() {
 
         {/* Booking Button - Only show if bookings are enabled and status has been loaded */}
         {mounted && bookingStatusLoaded && bookingsEnabled && (
-          <Dialog open={bookingOpen} onOpenChange={handleBookingOpenChange}>
+          <Dialog 
+            open={bookingOpen} 
+            onOpenChange={handleBookingOpenChange}
+          >
             <DialogTrigger className="hidden lg:flex items-center gap-3 text-white/80 hover:text-white transition-colors mr-1 sm:mr-2 md:mr-3 lg:mr-0" aria-label="Open Booking">
             <div className="flex items-center justify-center w-10 h-10 lg:w-12 lg:h-12 3xl:w-14 3xl:h-14 4xl:w-16 4xl:h-16 5xl:w-20 5xl:h-20 rounded-full bg-white border-2 border-[var(--hell-dusty-blue)]">
               <CalendarIcon className="w-5 h-5 lg:w-6 lg:h-6 3xl:w-7 3xl:h-7 4xl:w-8 4xl:h-8 5xl:w-10 5xl:h-10 text-[var(--hell-dusty-blue)]" />
@@ -1020,14 +1169,14 @@ export function Header() {
           </DialogTrigger>
 
           <DialogContent 
-            className={`top-0 left-0 translate-x-0 translate-y-0 w-full h-screen max-w-none sm:max-w-none rounded-none border-0 p-0 bg-transparent overflow-hidden ${isSubmitting ? '[&>button]:hidden [&>button]:pointer-events-none [&>button]:opacity-0' : ''}`}
+            className={`top-0 left-0 translate-x-0 translate-y-0 w-full h-screen max-w-none sm:max-w-none rounded-none border-0 p-0 bg-transparent overflow-hidden ${isSubmitting || showRecaptcha ? '[&>button]:hidden [&>button]:pointer-events-none [&>button]:opacity-0' : ''}`}
             onEscapeKeyDown={(e) => {
-              if (isSubmitting) {
+              if (isSubmitting || showRecaptcha) {
                 e.preventDefault()
               }
             }}
             onInteractOutside={(e) => {
-              if (isSubmitting) {
+              if (isSubmitting || showRecaptcha) {
                 e.preventDefault()
               }
             }}
@@ -1076,41 +1225,6 @@ export function Header() {
                           </p>
                         </div>
                       )}
-                      
-                      {/* reCAPTCHA v2 - Must be verified before using the form */}
-                      {process.env.NEXT_PUBLIC_USE_STATIC_IMAGES !== '1' && (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 'clamp(0.375rem, 0.5vw, 0.5rem)', paddingBottom: 'clamp(0.5rem, 0.6vw, 0.75rem)', borderBottom: '1px solid rgb(229 231 235)' }}>
-                          <p className="text-[#5a3a2a]/70 font-comfortaa" style={{ fontSize: 'clamp(0.625rem, 0.7vw, 0.75rem)' }}>
-                            Please verify you're human before proceeding:
-                          </p>
-                          <div 
-                            className="origin-left"
-                            style={{
-                              transform: 'scale(0.9)',
-                              transformOrigin: 'left center',
-                              position: 'relative',
-                              zIndex: 1000,
-                              pointerEvents: 'auto'
-                            }}
-                          >
-                            <Recaptcha
-                              key={recaptchaKeyRef.current}
-                              onVerify={handleRecaptchaVerify}
-                              onError={handleRecaptchaError}
-                              onExpire={handleRecaptchaExpire}
-                              size="compact"
-                            />
-                          </div>
-                          {!isRecaptchaVerified && (
-                            <p className={`font-comfortaa italic ${error ? "text-orange-600 font-medium" : "text-[#5a3a2a]/60"}`} style={{ fontSize: 'clamp(0.625rem, 0.7vw, 0.75rem)' }}>
-                              {error 
-                                ? "⚠️ Please verify CAPTCHA again to retry submission"
-                                : "Complete verification to enable form fields"
-                              }
-                            </p>
-                          )}
-                        </div>
-                      )}
   
                       {/* Section 1: Client Information */}
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 'clamp(0.5rem, 0.6vw, 0.75rem)', paddingBottom: 'clamp(0.75rem, 1vw, 1.25rem)', borderBottom: '2px solid rgb(229 231 235)' }}>
@@ -1130,8 +1244,8 @@ export function Header() {
                               value={formData.name || ""}
                               onChange={(e) => handleInputChange("name", e.target.value)}
                               placeholder="Your full name"
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
-                              className={`font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
+                              className="font-comfortaa"
                               style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                             />
                           </div>
@@ -1146,8 +1260,8 @@ export function Header() {
                               value={formData.email || ""}
                               onChange={(e) => handleInputChange("email", e.target.value)}
                               placeholder="your@email.com"
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
-                              className={`font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
+                              className="font-comfortaa"
                               style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                             />
                           </div>
@@ -1175,13 +1289,13 @@ export function Header() {
                               tabIndex={-1}
                               aria-hidden="true"
                             />
-                            <div className={`phone-input-wrapper ${!isRecaptchaVerified ? "opacity-50 pointer-events-none" : ""}`}>
+                            <div className="phone-input-wrapper">
                               <PhoneInput
                                 international
                                 defaultCountry="US"
                                 value={formData.phone || undefined}
                                 onChange={(value) => handleInputChange("phone", value || "")}
-                                disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                                disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                                 className="font-comfortaa"
                               />
                             </div>
@@ -1208,7 +1322,7 @@ export function Header() {
                                 value="single"
                                 checked={!formData.dateRange}
                                 onChange={() => handleDateRangeToggle(false)}
-                                disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                                disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                                 className="cursor-pointer"
                               />
                               <span className="font-comfortaa text-sm" style={{ fontSize: 'clamp(0.6875rem, 0.7vw, 0.75rem)' }}>Single Day</span>
@@ -1221,7 +1335,7 @@ export function Header() {
                                 value="range"
                                 checked={formData.dateRange}
                                 onChange={() => handleDateRangeToggle(true)}
-                                disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                                disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                                 className="cursor-pointer"
                               />
                               <span className="font-comfortaa text-sm" style={{ fontSize: 'clamp(0.6875rem, 0.7vw, 0.75rem)' }}>Multiple Days</span>
@@ -1245,7 +1359,7 @@ export function Header() {
                                   handleStartDateChange(new Date(e.target.value))
                                 }
                               }}
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                               style={{ 
                                 position: 'absolute',
                                 width: '1px',
@@ -1265,8 +1379,8 @@ export function Header() {
                                   id="startDate-visual"
                                   type="button"
                                   variant="outline"
-                                  disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
-                                  className={`w-full justify-start text-left font-normal font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed" : ""}`}
+                                  disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
+                                  className="w-full justify-start text-left font-normal font-comfortaa"
                                   style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                                   aria-labelledby="startDate-label"
                                   aria-describedby="startDate"
@@ -1286,6 +1400,8 @@ export function Header() {
                                   }}
                                   onSelect={handleStartDateChange}
                                   disabled={(date) => {
+                                    // Disable all dates when reCAPTCHA overlay is showing or during submission
+                                    if (showRecaptcha || isSubmitting) return true
                                     // Disable past dates and today (users cannot book current date)
                                     // Use Bangkok timezone for date comparison to ensure consistent behavior
                                     // regardless of user's browser timezone
@@ -1293,7 +1409,6 @@ export function Header() {
                                     const dateStr = dateToBangkokDateString(date)
                                     if (dateStr < todayStr) return true  // Disable past dates (Bangkok timezone)
                                     if (todayStr === dateStr) return true  // Disable today
-                                    if (!isRecaptchaVerified) return true
                                     if (process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1') return true
                                     // Check if date is unavailable (has confirmed booking)
                                     // Convert date to Bangkok timezone for proper comparison
@@ -1303,6 +1418,12 @@ export function Header() {
                                     }
                                     return isUnavailable
                                   }}
+                                  isOccupied={(date) => {
+                                    // Check if date is occupied (has confirmed booking)
+                                    const dateStr = dateToBangkokDateString(date)
+                                    return unavailableDates.has(dateStr)
+                                  }}
+                                  occupiedTimeRanges={unavailableTimeRanges}
                                 />
                               </PopoverContent>
                             </Popover>
@@ -1322,7 +1443,7 @@ export function Header() {
                                     handleEndDateChange(new Date(e.target.value))
                                   }
                                 }}
-                                disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                                disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                                 style={{ 
                                   position: 'absolute',
                                   width: '1px',
@@ -1342,8 +1463,8 @@ export function Header() {
                                     id="endDate-visual"
                                     type="button"
                                     variant="outline"
-                                    disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || !startDate}
-                                    className={`w-full justify-start text-left font-normal font-comfortaa ${!isRecaptchaVerified || !startDate ? "opacity-50 cursor-not-allowed" : ""}`}
+                                    disabled={showRecaptcha || isSubmitting || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || !startDate}
+                                    className={`w-full justify-start text-left font-normal font-comfortaa ${showRecaptcha || isSubmitting || !startDate ? "opacity-50 cursor-not-allowed" : ""}`}
                                     style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                                     aria-labelledby="endDate-label"
                                     aria-describedby="endDate"
@@ -1364,7 +1485,8 @@ export function Header() {
                                     }}
                                     onSelect={handleEndDateChange}
                                     disabled={(date) => {
-                                      if (!isRecaptchaVerified) return true
+                                      // Disable all dates when reCAPTCHA overlay is showing or during submission
+                                      if (showRecaptcha || isSubmitting) return true
                                       if (process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1') return true
                                       // Use Bangkok timezone for date comparison to ensure consistent behavior
                                       // regardless of user's browser timezone
@@ -1384,6 +1506,12 @@ export function Header() {
                                       }
                                       return isUnavailable
                                     }}
+                                    isOccupied={(date) => {
+                                      // Check if date is occupied (has confirmed booking)
+                                      const dateStr = dateToBangkokDateString(date)
+                                      return unavailableDates.has(dateStr)
+                                    }}
+                                    occupiedTimeRanges={unavailableTimeRanges}
                                   />
                                 </PopoverContent>
                               </Popover>
@@ -1398,9 +1526,9 @@ export function Header() {
                               name="startTime"
                               value={formData.startTime || ""}
                               onChange={(value) => handleInputChange("startTime", value)}
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                               required
-                              className={!isRecaptchaVerified ? "opacity-50 cursor-not-allowed" : ""}
+                              className=""
                             />
                           </div>
 
@@ -1412,9 +1540,9 @@ export function Header() {
                               name="endTime"
                               value={formData.endTime || ""}
                               onChange={(value) => handleInputChange("endTime", value)}
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                               required
-                              className={!isRecaptchaVerified ? "opacity-50 cursor-not-allowed" : ""}
+                              className=""
                             />
                           </div>
                         </div>
@@ -1440,8 +1568,8 @@ export function Header() {
                               value={formData.participants || ""}
                               onChange={(e) => handleInputChange("participants", e.target.value)}
                               placeholder="Enter number of participants"
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
-                              className={`font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
+                              className="font-comfortaa"
                               style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                             />
                           </div>
@@ -1454,7 +1582,7 @@ export function Header() {
                               name="eventType"
                               value={formData.eventType || ""}
                               onChange={(e) => handleInputChange("eventType", e.target.value)}
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                               style={{ 
                                 position: 'absolute',
                                 width: '1px',
@@ -1470,30 +1598,41 @@ export function Header() {
                               aria-labelledby="eventType-label"
                             >
                               <option value="">Select event type</option>
-                              <option value="Arts & Design Coaching">Arts & Design Coaching Workshop</option>
-                              <option value="Seminar & Workshop">Seminar & Workshop</option>
-                              <option value="Family Gathering">Family Gathering</option>
+                              <option value="Arts & Design Coaching Space">Arts & Design Coaching Space</option>
+                              <option value="Meeting, Seminar, Workshop">Meeting, Seminar, Workshop</option>
+                              <option value="Family & Friends Gathering">Family & Friends Gathering</option>
                               <option value="Holiday Festive">Holiday Festive</option>
                               <option value="Other">Other</option>
                             </select>
-                            <Select value={formData.eventType || ""} onValueChange={(value) => handleInputChange("eventType", value)} disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}>
+                            <Select value={formData.eventType || ""} onValueChange={(value) => handleInputChange("eventType", value)} disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}>
                               <SelectTrigger 
                                 id="eventType-visual" 
                                 aria-labelledby="eventType-label" 
                                 aria-describedby="eventType"
-                                className={`font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed" : ""}`} 
+                                className={`font-comfortaa`} 
                                 style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                               >
                                 <SelectValue placeholder="Select event type" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="Arts & Design Coaching">Arts & Design Coaching Workshop</SelectItem>
-                                <SelectItem value="Seminar & Workshop">Seminar & Workshop</SelectItem>
-                                <SelectItem value="Family Gathering">Family Gathering</SelectItem>
+                                <SelectItem value="Arts & Design Coaching Space">Arts & Design Coaching Space</SelectItem>
+                                <SelectItem value="Meeting, Seminar, Workshop">Meeting, Seminar, Workshop</SelectItem>
+                                <SelectItem value="Family & Friends Gathering">Family & Friends Gathering</SelectItem>
                                 <SelectItem value="Holiday Festive">Holiday Festive</SelectItem>
                                 <SelectItem value="Other">Other</SelectItem>
                               </SelectContent>
                             </Select>
+                            {/* Event Type Remarks */}
+                            {formData.eventType === "Family & Friends Gathering" && (
+                              <p className="text-[#5a3a2a]/70 font-comfortaa italic" style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', marginTop: 'clamp(0.25rem, 0.3vw, 0.375rem)' }}>
+                                eg. Engagement/Pre-wedding/Wedding, Reunion, Baby Shower, Private Dining, etc.
+                              </p>
+                            )}
+                            {formData.eventType === "Holiday Festive" && (
+                              <p className="text-[#5a3a2a]/70 font-comfortaa italic" style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', marginTop: 'clamp(0.25rem, 0.3vw, 0.375rem)' }}>
+                                eg. Christmas, New Year, Easter, etc.
+                              </p>
+                            )}
                           </div>
                         </div>
 
@@ -1509,8 +1648,8 @@ export function Header() {
                               value={formData.otherEventType || ""}
                               onChange={(e) => handleInputChange("otherEventType", e.target.value)}
                               placeholder="Please specify your event type"
-                              disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
-                              className={`font-comfortaa ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                              disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
+                              className="font-comfortaa"
                               style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', height: 'clamp(2rem, 2.2vw, 2.25rem)' }}
                             />
                           </div>
@@ -1524,18 +1663,18 @@ export function Header() {
                             name="organizationType"
                             value={formData.organizationType || ""}
                             onValueChange={(value) => handleInputChange("organizationType", value)}
-                            disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                            disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                             className="flex flex-row gap-6"
                             aria-labelledby="organizationType-label"
                           >
                             <div className="flex items-center space-x-2">
-                              <RadioGroupItem value="Tailor Event" id="tailor-event" disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'} />
+                              <RadioGroupItem value="Tailor Event" id="tailor-event" disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting} />
                               <Label htmlFor="tailor-event" className="font-comfortaa cursor-pointer" style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)' }}>
                                 Tailor Event
                               </Label>
                             </div>
                             <div className="flex items-center space-x-2">
-                              <RadioGroupItem value="Space Only" id="space-only" disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'} />
+                              <RadioGroupItem value="Space Only" id="space-only" disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting} />
                               <Label htmlFor="space-only" className="font-comfortaa cursor-pointer" style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)' }}>
                                 Space Only
                               </Label>
@@ -1558,10 +1697,10 @@ export function Header() {
                             required
                             value={formData.introduction || ""}
                             onChange={(e) => handleInputChange("introduction", e.target.value)}
-                            placeholder={isRecaptchaVerified ? "Tell us what you desire..." : "Please complete CAPTCHA verification first..."}
-                            disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                            placeholder="Tell us what you desire..."
+                            disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                             rows={3}
-                            className={`font-comfortaa resize-none ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                            className="font-comfortaa resize-none"
                             style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', minHeight: 'clamp(4rem, 4.5vw, 5rem)' }}
                           />
                         </div>
@@ -1575,10 +1714,10 @@ export function Header() {
                             autoComplete="off"
                             value={formData.specialRequests || ""}
                             onChange={(e) => handleInputChange("specialRequests", e.target.value)}
-                            placeholder={isRecaptchaVerified ? "Describe any special requirements..." : "Please complete CAPTCHA verification first..."}
-                            disabled={!isRecaptchaVerified || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                            placeholder="Describe any special requirements..."
+                            disabled={process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha || isSubmitting}
                             rows={3}
-                            className={`font-comfortaa resize-none ${!isRecaptchaVerified ? "opacity-50 cursor-not-allowed bg-gray-100" : ""}`}
+                            className="font-comfortaa resize-none"
                             style={{ fontSize: 'clamp(0.75rem, 0.8vw, 0.875rem)', minHeight: 'clamp(4rem, 4.5vw, 5rem)' }}
                           />
                         </div>
@@ -1627,7 +1766,7 @@ export function Header() {
                       <div className="flex flex-col items-center space-y-1.5 sm:space-y-2 lg:space-y-1 pt-2 sm:pt-2.5 lg:pt-1.5">
                         <Button
                           type="submit"
-                          disabled={!isRecaptchaVerified || isSubmitting || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1'}
+                          disabled={isSubmitting || !bookingsEnabled || process.env.NEXT_PUBLIC_USE_STATIC_IMAGES === '1' || showRecaptcha}
                           className="font-comfortaa bg-[#5B9AB8] hover:bg-[#4d8ea7] text-white disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                           style={{ 
                             padding: 'clamp(0.5rem, 0.6vw, 0.75rem) clamp(1rem, 1.2vw, 1.5rem)',
@@ -1656,6 +1795,75 @@ export function Header() {
                 </div>
               </div>
             </div>
+            
+            {/* reCAPTCHA Overlay - Shows after form validation passes */}
+            {showRecaptcha && bookingOpen && process.env.NEXT_PUBLIC_USE_STATIC_IMAGES !== '1' && (
+              <div 
+                className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                onClick={(e) => {
+                  // Only close if clicking the backdrop, not the content
+                  if (e.target === e.currentTarget && !isSubmitting) {
+                    setShowRecaptcha(false)
+                    setRecaptchaToken(null)
+                    setIsRecaptchaVerified(false)
+                    recaptchaShownAtRef.current = null
+                    recaptchaKeyRef.current += 1
+                  }
+                }}
+              >
+                <div 
+                  className="bg-white rounded-lg shadow-2xl p-6 sm:p-8 max-w-md w-full mx-4"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex flex-col items-center gap-4">
+                    <h3 className="text-[#5a3a2a] font-comfortaa font-bold text-lg sm:text-xl text-center">
+                      Verify You're Human
+                    </h3>
+                    <p className="text-[#5a3a2a]/70 font-comfortaa text-sm text-center">
+                      Please complete the verification to submit your booking inquiry.
+                    </p>
+                    <div 
+                      className="flex justify-center w-full"
+                      style={{
+                        position: 'relative',
+                        zIndex: 10000,
+                        pointerEvents: 'auto',
+                      }}
+                    >
+                      <Recaptcha
+                        key={recaptchaKeyRef.current}
+                        onVerify={handleRecaptchaVerify}
+                        onError={handleRecaptchaError}
+                        onExpire={handleRecaptchaExpire}
+                        size="normal"
+                      />
+                    </div>
+                    {!isSubmitting && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => {
+                          setShowRecaptcha(false)
+                          setRecaptchaToken(null)
+                          setIsRecaptchaVerified(false)
+                          recaptchaShownAtRef.current = null
+                          recaptchaKeyRef.current += 1
+                        }}
+                        className="font-comfortaa mt-2"
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                    {isSubmitting && (
+                      <div className="flex items-center gap-2 mt-2">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span className="font-comfortaa text-sm text-[#5a3a2a]">Submitting...</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
           </DialogContent>
         </Dialog>
         )}

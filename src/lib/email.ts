@@ -257,7 +257,7 @@ function sanitizeUserInput(input: string | null | undefined): string {
 }
 
 // Generate HTML email template for admin notification
-function generateAdminEmailHTML(data: ReservationData): string {
+function generateAdminEmailHTML(data: ReservationData, referenceNumber?: string): string {
   const formattedDateRange = formatDateRange(data)
   const formattedEventType = formatEventType(data.eventType, data.otherEventType)
   const organizationRemark = data.organizationType === "Tailor Event" ? "Organized by HU" : "Organized by Client"
@@ -344,6 +344,12 @@ function generateAdminEmailHTML(data: ReservationData): string {
   <div class="content">
     <div class="section">
       <div class="section-title">Booking Details</div>
+      ${referenceNumber ? `
+      <div class="field">
+        <span class="field-label">Reference Number:</span>
+        <span class="field-value" style="font-weight: bold; color: #5B9AB8;">${sanitizeHTML(referenceNumber)}</span>
+      </div>
+      ` : ''}
       <div class="field">
         <span class="field-label">Name:</span>
         <span class="field-value">${sanitizeHTML(data.name)}</span>
@@ -432,7 +438,7 @@ function generateAdminEmailHTML(data: ReservationData): string {
 }
 
 // Generate plain text version for admin notification
-function generateAdminEmailText(data: ReservationData): string {
+function generateAdminEmailText(data: ReservationData, referenceNumber?: string): string {
   const formattedDateRange = formatDateRange(data)
   const formattedEventType = formatEventType(data.eventType, data.otherEventType)
   const organizationRemark = data.organizationType === "Tailor Event" ? "Organized by HU" : "Organized by Client"
@@ -444,7 +450,7 @@ NEW RESERVATION INQUIRY - HELL UNIVERSITY
 
 BOOKING DETAILS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Name: ${data.name}
+${referenceNumber ? `Reference Number: ${referenceNumber}\n` : ''}Name: ${data.name}
 Email: ${data.email}
 Phone: ${data.phone}
 Number of Participants: ${safeParticipants}
@@ -468,7 +474,7 @@ Received: ${new Date().toLocaleString('en-US', {
 }
 
 // Generate HTML email template for user auto-reply
-function generateUserEmailHTML(data: ReservationData): string {
+function generateUserEmailHTML(data: ReservationData, referenceNumber?: string): string {
   const formattedDateRange = formatDateRange(data)
   const formattedEventType = formatEventType(data.eventType, data.otherEventType)
   const organizationRemark = data.organizationType === "Tailor Event" ? "Organized by HU" : "Organized by Client"
@@ -543,6 +549,11 @@ function generateUserEmailHTML(data: ReservationData): string {
     
     <div class="summary">
       <h3 style="margin-top: 0; color: #5a3a2a;">Your Inquiry Summary:</h3>
+      ${referenceNumber ? `
+      <div class="summary-item">
+        <span class="summary-label">Reference Number:</span> <strong style="color: #3e82bb;">${sanitizeHTML(referenceNumber)}</strong>
+      </div>
+      ` : ''}
       <div class="summary-item">
         <span class="summary-label">Event Type:</span> ${sanitizeHTML(formattedEventType)}
       </div>
@@ -556,8 +567,6 @@ function generateUserEmailHTML(data: ReservationData): string {
         <span class="summary-label">Organization:</span> ${sanitizeHTML(safeOrganizationType)} (${sanitizeHTML(organizationRemark)})
       </div>
     </div>
-    
-    <p>We honor each request with thoughtful consideration and will respond within <strong>48 hours</strong> to discuss your vision and craft an extraordinary experience tailored to your unique sensibilities.</p>
     
     <p>If you have any urgent questions or need to modify your inquiry, please don't hesitate to contact us.</p>
     
@@ -578,7 +587,7 @@ function generateUserEmailHTML(data: ReservationData): string {
 }
 
 // Generate plain text version for user auto-reply
-function generateUserEmailText(data: ReservationData): string {
+function generateUserEmailText(data: ReservationData, referenceNumber?: string): string {
   const formattedDateRange = formatDateRange(data)
   const formattedEventType = formatEventType(data.eventType, data.otherEventType)
   const organizationRemark = data.organizationType === "Tailor Event" ? "Organized by HU" : "Organized by Client"
@@ -594,12 +603,10 @@ Thank you for your reservation inquiry with Hell University! We have received yo
 
 YOUR INQUIRY SUMMARY:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Event Type: ${formattedEventType}
+${referenceNumber ? `Reference Number: ${referenceNumber}\n` : ''}Event Type: ${formattedEventType}
 Date & Time: ${formattedDateRange}
 Number of Participants: ${safeParticipants}
 Organization: ${safeOrganizationType} (${organizationRemark})
-
-We honor each request with thoughtful consideration and will respond within 48 hours to discuss your vision and craft an extraordinary experience tailored to your unique sensibilities.
 
 If you have any urgent questions or need to modify your inquiry, please don't hesitate to contact us.
 
@@ -626,15 +633,17 @@ export async function sendAdminNotification(data: ReservationData, bookingId?: s
   const formattedEventType = formatEventType(data.eventType, data.otherEventType)
   const formattedDateRange = formatDateRange(data)
   // CRITICAL: Always start subject with booking reference number for easy identification
-  const referencePrefix = bookingId ? `[${bookingId}] ` : ''
+  // Use referenceNumber if provided, otherwise fall back to bookingId
+  const referenceNumber = bookingId || undefined
+  const referencePrefix = referenceNumber ? `[${referenceNumber}] ` : ''
 
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University Reservation System" <${process.env.SMTP_USER}>`,
     to: recipientEmail,
     replyTo: data.email,
     subject: `${referencePrefix}New Reservation Inquiry - ${formattedEventType} - ${formattedDateRange.substring(0, 50)}`,
-    text: generateAdminEmailText(data),
-    html: generateAdminEmailHTML(data),
+    text: generateAdminEmailText(data, referenceNumber),
+    html: generateAdminEmailHTML(data, referenceNumber),
   }
 
   try {
@@ -646,7 +655,7 @@ export async function sendAdminNotification(data: ReservationData, bookingId?: s
   } catch (error) {
     // Queue email for retry
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-    console.error('Failed to send admin notification, queuing for retry:', errorMessage)
+    console.error(`[sendAdminNotification] ❌ Failed to send admin notification, queuing for retry:`, errorMessage)
     
     try {
       await addEmailToQueue(
@@ -655,17 +664,17 @@ export async function sendAdminNotification(data: ReservationData, bookingId?: s
         mailOptions.subject as string,
         mailOptions.html as string,
         mailOptions.text as string,
-        { bookingData: data, replyTo: data.email }
+        { bookingData: data, replyTo: data.email, bookingId: bookingId }
       )
-      console.log('Admin notification queued for retry')
+      console.log(`[sendAdminNotification] ✅ Admin notification queued for retry`)
+      // Don't throw error if email was successfully queued - it will be sent by the queue processor
+      // Return normally so calling function knows it was queued (not sent, but will be sent)
+      return
     } catch (queueError) {
-      console.error('Failed to queue admin notification:', queueError)
-      // Re-throw original error if queueing fails
+      console.error(`[sendAdminNotification] ❌ Failed to queue admin notification for retry:`, queueError)
+      // Only throw if queueing also fails - this is a critical error
       throw error
     }
-    
-    // Re-throw original error
-    throw error
   }
 }
 
@@ -675,25 +684,29 @@ export async function sendAdminNotification(data: ReservationData, bookingId?: s
  */
 export async function sendUserConfirmation(data: ReservationData, bookingId?: string): Promise<void> {
   // CRITICAL: Always start subject with booking reference number for easy identification
-  const referencePrefix = bookingId ? `[${bookingId}] ` : ''
+  // Use referenceNumber if provided, otherwise fall back to bookingId
+  const referenceNumber = bookingId || undefined
+  const referencePrefix = referenceNumber ? `[${referenceNumber}] ` : ''
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University" <${process.env.SMTP_USER}>`,
     to: data.email,
     subject: `${referencePrefix}Reservation Inquiry Received - Hell University`,
-    text: generateUserEmailText(data),
-    html: generateUserEmailHTML(data),
+    text: generateUserEmailText(data, referenceNumber),
+    html: generateUserEmailHTML(data, referenceNumber),
   }
 
+  console.log(`[sendUserConfirmation] Attempting to send user confirmation email to ${data.email} (booking: ${bookingId || 'N/A'})`)
+  
   try {
     const emailTransporter = await getTransporter()
     const result = await emailTransporter.sendMail(mailOptions)
     
     // Log successful send (nodemailer v7 returns messageId)
-    console.log('User confirmation email sent:', result.messageId)
+    console.log(`[sendUserConfirmation] ✅ User confirmation email sent successfully: ${result.messageId} to ${data.email}`)
   } catch (error) {
     // Queue email for retry
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-    console.error('Failed to send user confirmation, queuing for retry:', errorMessage)
+    console.error(`[sendUserConfirmation] ❌ Failed to send user confirmation to ${data.email} (booking: ${bookingId || 'N/A'}), queuing for retry:`, errorMessage)
     
     try {
       await addEmailToQueue(
@@ -702,17 +715,17 @@ export async function sendUserConfirmation(data: ReservationData, bookingId?: st
         mailOptions.subject as string,
         mailOptions.html as string,
         mailOptions.text as string,
-        { bookingData: data }
+        { bookingData: data, bookingId: bookingId }
       )
-      console.log('User confirmation queued for retry')
+      console.log(`[sendUserConfirmation] ✅ User confirmation queued for retry to ${data.email}`)
+      // Don't throw error if email was successfully queued - it will be sent by the queue processor
+      // Return normally so calling function knows it was queued (not sent, but will be sent)
+      return
     } catch (queueError) {
-      console.error('Failed to queue user confirmation:', queueError)
-      // Re-throw original error if queueing fails
+      console.error(`[sendUserConfirmation] ❌ Failed to queue user confirmation for retry:`, queueError)
+      // Only throw if queueing also fails - this is a critical error
       throw error
     }
-    
-    // Re-throw original error
-    throw error
   }
 }
 
@@ -730,13 +743,15 @@ export async function sendReservationEmails(
   let userSent = false
 
   // Send admin notification FIRST - MUST succeed before sending user email
+  // Note: If email fails but gets queued, sendAdminNotification returns normally (doesn't throw)
+  // This allows user email to still be sent even if admin email was queued
   try {
     console.error('='.repeat(60))
     console.error('STEP 1: Attempting to send admin notification email...')
     console.error('='.repeat(60))
     await sendAdminNotification(data, bookingReference)
     adminSent = true
-    console.error('✅ Admin notification sent successfully')
+    console.error('✅ Admin notification sent or queued successfully')
     console.error('='.repeat(60))
   } catch (error) {
     // Handle different types of errors
@@ -795,15 +810,16 @@ export async function sendReservationEmails(
     return result
   }
   
-  // Only execute if admin email succeeded
-  console.error('✅ Admin email succeeded, proceeding to send user email...')
+  // Only execute if admin email succeeded or was queued
+  // Note: If user email fails but gets queued, sendUserConfirmation returns normally (doesn't throw)
+  console.error('✅ Admin email succeeded or queued, proceeding to send user email...')
   try {
     console.error('='.repeat(60))
     console.error('STEP 2: Attempting to send user confirmation email...')
     console.error('='.repeat(60))
     await sendUserConfirmation(data, bookingReference)
     userSent = true
-    console.error('✅ User confirmation sent successfully')
+    console.error('✅ User confirmation sent or queued successfully')
     console.error('='.repeat(60))
   } catch (error) {
     // Handle different types of errors
@@ -1008,6 +1024,12 @@ function generateStatusChangeEmailHTML(
               <div style="background-color: #f9fafb; border-left: 4px solid ${statusInfo.color}; padding: 20px; margin: 20px 0; border-radius: 4px;">
                 <h3 style="margin: 0 0 15px 0; color: #111827; font-size: 18px;">Reservation Details</h3>
                 <table width="100%" cellpadding="5" cellspacing="0">
+                  ${booking.referenceNumber ? `
+                  <tr>
+                    <td style="color: #6b7280; font-size: 14px; width: 120px;">Reference Number:</td>
+                    <td style="color: ${statusInfo.color}; font-size: 14px; font-weight: 600;">${sanitizeHTML(booking.referenceNumber)}</td>
+                  </tr>
+                  ` : ''}
                   <tr>
                     <td style="color: #6b7280; font-size: 14px; width: 120px;">Event Type:</td>
                     <td style="color: #111827; font-size: 14px; font-weight: 500;">${sanitizeHTML(formattedEventType)}</td>
@@ -1301,9 +1323,11 @@ function generateStatusChangeEmailText(
     endTime: booking.endTime,
   } as ReservationData)
 
+  const referenceNumber = booking.referenceNumber || booking.id
   let text = `Dear ${booking.name},\n\n`
   text += `${message}\n\n`
   text += `RESERVATION DETAILS:\n`
+  text += `Reference Number: ${referenceNumber}\n`
   text += `Event Type: ${formattedEventType}\n`
   text += `Date & Time: ${formattedDateRange}\n\n`
 
@@ -1601,6 +1625,12 @@ export async function sendAdminUserResponseNotification(
               <div style="background-color: #f9fafb; border-left: 4px solid ${responseInfo.color}; padding: 20px; margin: 20px 0; border-radius: 4px;">
                 <h3 style="margin: 0 0 15px 0; color: #111827; font-size: 18px;">Reservation Details</h3>
                 <table width="100%" cellpadding="5" cellspacing="0">
+                  ${booking.referenceNumber ? `
+                  <tr>
+                    <td style="color: #6b7280; font-size: 14px; width: 120px;">Reference Number:</td>
+                    <td style="color: ${responseInfo.color}; font-size: 14px; font-weight: 600;">${sanitizeHTML(booking.referenceNumber)}</td>
+                  </tr>
+                  ` : ''}
                   <tr>
                     <td style="color: #6b7280; font-size: 14px; width: 120px;">Name:</td>
                     <td style="color: #111827; font-size: 14px; font-weight: 500;">${sanitizeHTML(booking.name)}</td>
@@ -1662,12 +1692,15 @@ export async function sendAdminUserResponseNotification(
 </html>
   `
 
+  // CRITICAL: Always start subject with booking reference number for easy identification
+  const referenceNumber = booking.referenceNumber || booking.id
   const textContent = `
 ${responseInfo.title}
 
 ${responseInfo.message}
 
 RESERVATION DETAILS:
+Reference Number: ${referenceNumber}
 Name: ${booking.name}
 Email: ${booking.email}
 Phone: ${booking.phone || 'N/A'}
@@ -1683,9 +1716,6 @@ Please review this response in the admin dashboard.
 Best regards,
 Hell University Reservation System
   `.trim()
-
-  // CRITICAL: Always start subject with booking reference number for easy identification
-  const referenceNumber = booking.referenceNumber || booking.id
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University Reservation System" <${process.env.SMTP_USER}>`,
     to: recipientEmail,
@@ -1807,7 +1837,7 @@ export async function sendAdminAutoUpdateNotification(
                   return `
                   <div style="background-color: #ffffff; padding: 15px; margin: 10px 0; border-radius: 4px; border: 1px solid #a7f3d0;">
                     <p style="margin: 0 0 5px 0; color: #111827; font-size: 14px; font-weight: 500;">
-                      ${sanitizeHTML(booking.name)} - ${sanitizeHTML(formattedEventType)}
+                      ${sanitizeHTML(booking.referenceNumber || booking.id)} - ${sanitizeHTML(booking.name)} - ${sanitizeHTML(formattedEventType)}
                     </p>
                     <p style="margin: 0; color: #6b7280; font-size: 12px;">
                       ${sanitizeHTML(formattedDateRange)}
@@ -1838,7 +1868,7 @@ export async function sendAdminAutoUpdateNotification(
                   return `
                   <div style="background-color: #ffffff; padding: 15px; margin: 10px 0; border-radius: 4px; border: 1px solid #fecaca;">
                     <p style="margin: 0 0 5px 0; color: #111827; font-size: 14px; font-weight: 500;">
-                      ${sanitizeHTML(booking.name)} - ${sanitizeHTML(formattedEventType)}
+                      ${sanitizeHTML(booking.referenceNumber || booking.id)} - ${sanitizeHTML(booking.name)} - ${sanitizeHTML(formattedEventType)}
                     </p>
                     <p style="margin: 0; color: #6b7280; font-size: 12px;">
                       ${sanitizeHTML(formattedDateRange)}
@@ -1883,7 +1913,8 @@ ${finishedBookings.length > 0 ? `FINISHED BOOKINGS (${finishedBookings.length}):
     startTime: booking.startTime,
     endTime: booking.endTime,
   } as ReservationData)
-  return `- ${booking.name} - ${formattedEventType} (${formattedDateRange})`
+  const referenceNumber = booking.referenceNumber || booking.id
+  return `- ${referenceNumber} - ${booking.name} - ${formattedEventType} (${formattedDateRange})`
 }).join('\n')}\n\n` : ''}
 
 ${cancelledBookings.length > 0 ? `CANCELLED BOOKINGS (${cancelledBookings.length}):\n${cancelledBookings.map(({ booking }) => {
@@ -1895,7 +1926,8 @@ ${cancelledBookings.length > 0 ? `CANCELLED BOOKINGS (${cancelledBookings.length
     startTime: booking.startTime,
     endTime: booking.endTime,
   } as ReservationData)
-  return `- ${booking.name} - ${formattedEventType} (${formattedDateRange})`
+  const referenceNumber = booking.referenceNumber || booking.id
+  return `- ${referenceNumber} - ${booking.name} - ${formattedEventType} (${formattedDateRange})`
 }).join('\n')}\n\n` : ''}
 
 All updated bookings have been moved to the archive and are no longer visible in the main bookings list.
@@ -2104,6 +2136,12 @@ export async function sendAdminStatusChangeNotification(
               <div style="background-color: #f9fafb; border-left: 4px solid ${statusInfo.color}; padding: 20px; margin: 20px 0; border-radius: 4px;">
                 <h3 style="margin: 0 0 15px 0; color: #111827; font-size: 18px;">Booking Details</h3>
                 <table width="100%" cellpadding="5" cellspacing="0">
+                  ${booking.referenceNumber ? `
+                  <tr>
+                    <td style="color: #6b7280; font-size: 14px; width: 120px;">Reference Number:</td>
+                    <td style="color: ${statusInfo.color}; font-size: 14px; font-weight: 600;">${sanitizeHTML(booking.referenceNumber)}</td>
+                  </tr>
+                  ` : ''}
                   <tr>
                     <td style="color: #6b7280; font-size: 14px; width: 120px;">Name:</td>
                     <td style="color: #111827; font-size: 14px; font-weight: 500;">${sanitizeHTML(booking.name)}</td>
@@ -2194,11 +2232,13 @@ export async function sendAdminStatusChangeNotification(
 </html>
   `.trim()
 
+  const referenceNumber = booking.referenceNumber || booking.id
   let textContent = `${statusInfo.title}
 
 ${statusInfo.message}
 
 BOOKING DETAILS:
+Reference Number: ${referenceNumber}
 Name: ${booking.name}
 Email: ${booking.email}
 Phone: ${booking.phone || 'N/A'}
@@ -2247,7 +2287,6 @@ Hell University Reservation System
   `.trim()
 
   // CRITICAL: Always start subject with booking reference number for easy identification
-  const referenceNumber = booking.referenceNumber || booking.id
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University Reservation System" <${process.env.SMTP_USER}>`,
     to: recipientEmail,
@@ -2511,6 +2550,12 @@ export async function sendAdminCheckInNotification(booking: Booking): Promise<vo
               <div style="background-color: #f9fafb; border-left: 4px solid #10b981; padding: 20px; margin: 20px 0; border-radius: 4px;">
                 <h3 style="margin: 0 0 15px 0; color: #111827; font-size: 18px;">Booking Details</h3>
                 <table width="100%" cellpadding="5" cellspacing="0">
+                  ${booking.referenceNumber ? `
+                  <tr>
+                    <td style="color: #6b7280; font-size: 14px; width: 120px;">Reference Number:</td>
+                    <td style="color: #10b981; font-size: 14px; font-weight: 600;">${sanitizeHTML(booking.referenceNumber)}</td>
+                  </tr>
+                  ` : ''}
                   <tr>
                     <td style="color: #6b7280; font-size: 14px; width: 120px;">Name:</td>
                     <td style="color: #111827; font-size: 14px; font-weight: 500;">${sanitizeHTML(booking.name)}</td>
@@ -2556,11 +2601,13 @@ export async function sendAdminCheckInNotification(booking: Booking): Promise<vo
 </html>
   `.trim()
 
+  const referenceNumber = booking.referenceNumber || booking.id
   const textContent = `User Checked In
 
 A user has confirmed their check-in for their reservation.
 
 BOOKING DETAILS:
+Reference Number: ${referenceNumber}
 Name: ${booking.name}
 Email: ${booking.email}
 Phone: ${booking.phone || 'N/A'}
@@ -2575,7 +2622,6 @@ Hell University Reservation System
   `.trim()
 
   // CRITICAL: Always start subject with booking reference number for easy identification
-  const referenceNumber = booking.referenceNumber || booking.id
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University Reservation System" <${process.env.SMTP_USER}>`,
     to: recipientEmail,
@@ -2670,6 +2716,12 @@ export async function sendAdminBookingDeletionNotification(
               <div style="background-color: #f9fafb; border-left: 4px solid #ef4444; padding: 20px; margin: 20px 0; border-radius: 4px;">
                 <h3 style="margin: 0 0 15px 0; color: #111827; font-size: 18px;">Deleted Booking Details</h3>
                 <table width="100%" cellpadding="5" cellspacing="0">
+                  ${booking.referenceNumber ? `
+                  <tr>
+                    <td style="color: #6b7280; font-size: 14px; width: 120px;">Reference Number:</td>
+                    <td style="color: #ef4444; font-size: 14px; font-weight: 600;">${sanitizeHTML(booking.referenceNumber)}</td>
+                  </tr>
+                  ` : ''}
                   <tr>
                     <td style="color: #6b7280; font-size: 14px; width: 120px;">Name:</td>
                     <td style="color: #111827; font-size: 14px; font-weight: 500;">${sanitizeHTML(booking.name)}</td>
@@ -2721,11 +2773,13 @@ export async function sendAdminBookingDeletionNotification(
 </html>
   `.trim()
 
+  const referenceNumber = booking.referenceNumber || booking.id
   const textContent = `Booking Deleted
 
 A booking has been deleted from the system.
 
 DELETED BOOKING DETAILS:
+Reference Number: ${referenceNumber}
 Name: ${booking.name}
 Email: ${booking.email}
 Phone: ${booking.phone || 'N/A'}
@@ -2741,7 +2795,6 @@ Hell University Reservation System
   `.trim()
 
   // CRITICAL: Always start subject with booking reference number for easy identification
-  const referenceNumber = booking.referenceNumber || booking.id
   const mailOptions: nodemailer.SendMailOptions = {
     from: `"Hell University Reservation System" <${process.env.SMTP_USER}>`,
     to: recipientEmail,

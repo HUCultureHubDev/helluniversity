@@ -65,6 +65,7 @@ import { SearchInputWithHistory } from "@/components/admin/SearchInputWithHistor
 import { FilterPresetsDialog } from "@/components/admin/FilterPresetsDialog"
 import { AdvancedBookingFilters } from "@/components/admin/AdvancedBookingFilters"
 import { useBookingActions } from "@/hooks/useBookingActions"
+import { useActionLocks } from "@/hooks/useActionLocks"
 import { getAvailableActions, mapActionToStatus, type ActionDefinition } from "@/lib/booking-state-machine"
 import { calculateStartTimestamp } from "@/lib/booking-validations"
 import { getBangkokTime } from "@/lib/timezone"
@@ -75,26 +76,15 @@ import { SimpleCalendar } from "@/components/ui/simple-calendar"
 import { TimePicker } from "@/components/ui/time-picker"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { dateToBangkokDateString } from "@/lib/timezone-client"
-
-// Helper function to add AM/PM to 24-hour time format for display
-// Converts "13:00" -> "13:00 PM", "09:30" -> "09:30 AM", "00:00" -> "00:00 AM"
-function formatTimeForDisplay(time24: string | null | undefined): string {
-  if (!time24 || !time24.includes(':')) return time24 || ''
-  
-  try {
-    const [hours, minutes] = time24.split(':')
-    const hour24 = parseInt(hours, 10)
-    const mins = minutes || '00'
-    
-    if (isNaN(hour24)) return time24
-    
-    // Keep 24-hour format, just add AM/PM
-    const period = hour24 < 12 ? 'AM' : 'PM'
-    return `${time24} ${period}`
-  } catch (error) {
-    return time24
-  }
-}
+import { BookingTable } from "@/components/admin/BookingTable"
+import {
+  formatTimeForDisplay,
+  formatDate,
+  formatTimestamp,
+  formatFee,
+  getStatusBadge,
+  getBookingReferenceNumber,
+} from "@/lib/booking-helpers"
 
 // Use Booking type from hook to ensure consistency
 type Booking = BookingType
@@ -107,24 +97,6 @@ interface StatusHistory {
   changed_by: string | null
   change_reason: string | null
   created_at: number
-}
-
-// Helper function to get booking reference number with fallback for old records
-// Generates a deterministic reference number based on booking ID if missing
-// Updated to match new format: 3 chars timestamp + 3 chars random (HU-XXXXXX)
-function getBookingReferenceNumber(booking: Booking): string {
-  if (booking.reference_number) {
-    return booking.reference_number
-  }
-  // For old records without reference_number, generate a deterministic one based on ID
-  // Use last 8 characters of UUID and convert to base36-like format
-  // This ensures the same booking always gets the same reference number
-  // Updated to new format: 3 chars + 3 chars (was 3 chars + 2 chars)
-  const idPart = booking.id.replace(/-/g, '').slice(-8)
-  const numValue = parseInt(idPart, 16) % 46656 // 36^3
-  // Use first 4 hex chars of ID for deterministic "random" part (was 2 chars)
-  const deterministicPart = parseInt(idPart.slice(0, 4), 16) % 46656 // 36^3
-  return `HU-${numValue.toString(36).toUpperCase().padStart(3, '0')}${deterministicPart.toString(36).toUpperCase().padStart(3, '0')}`
 }
 
 export default function BookingsPage() {
@@ -177,6 +149,7 @@ export default function BookingsPage() {
   const [nameFilter, setNameFilter] = useState("")
   const [phoneFilter, setPhoneFilter] = useState("")
   const [eventTypeFilter, setEventTypeFilter] = useState<string>("all")
+  const [depositStatusFilter, setDepositStatusFilter] = useState<string>("all")
   
   // Debounced filter values for API calls (prevents refetch on every keystroke)
   const [debouncedEmailFilter, setDebouncedEmailFilter] = useState("")
@@ -205,6 +178,13 @@ export default function BookingsPage() {
   const [dateRangeToggle, setDateRangeToggle] = useState<"single" | "multiple">("single")
   // Unavailable dates for date change calendar (excludes current booking's dates)
   const [unavailableDatesForDateChange, setUnavailableDatesForDateChange] = useState<Set<string>>(new Set())
+  const [unavailableTimeRangesForDateChange, setUnavailableTimeRangesForDateChange] = useState<Array<{
+    date: string
+    startTime: string | null
+    endTime: string | null
+    startDate: number
+    endDate: number
+  }>>([])
   const [calendarMonth, setCalendarMonth] = useState<Date>(new Date())
   const [newResponsesCount, setNewResponsesCount] = useState<number>(0)
   const [confirmationDialogOpen, setConfirmationDialogOpen] = useState(false)
@@ -233,6 +213,32 @@ export default function BookingsPage() {
   useEffect(() => {
     viewDialogOpenRef.current = viewDialogOpen
   }, [viewDialogOpen])
+  
+  // CRITICAL: Refetch booking details when dialog opens to ensure fresh data
+  // This prevents stale status from being displayed when opening dialog after status change
+  // Use a ref to track the last fetched booking ID to prevent unnecessary refetches
+  const lastFetchedBookingIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (viewDialogOpen && selectedBooking?.id) {
+      // Only refetch if this is a different booking or if we haven't fetched this one yet
+      // This prevents infinite loops while ensuring fresh data when dialog opens
+      if (lastFetchedBookingIdRef.current !== selectedBooking.id) {
+        lastFetchedBookingIdRef.current = selectedBooking.id
+        // Always refetch when dialog opens to ensure we have the latest data
+        // This is especially important after status changes
+        // Add small delay to ensure backend cache invalidation completes
+        const fetchFreshData = async () => {
+          // Small delay to ensure cache invalidation from previous status update completes
+          await new Promise(resolve => setTimeout(resolve, 50))
+          await fetchBookingDetails(selectedBooking.id)
+        }
+        fetchFreshData()
+      }
+    } else if (!viewDialogOpen) {
+      // Reset ref when dialog closes
+      lastFetchedBookingIdRef.current = null
+    }
+  }, [viewDialogOpen, selectedBooking?.id]) // Depend on both to refetch when booking changes
   
   // Fix accessibility issue: When nested dialogs open, blur focused elements in underlying dialogs
   // This prevents aria-hidden violation when a dialog is hidden behind another dialog
@@ -312,11 +318,19 @@ export default function BookingsPage() {
   // Event types for filter dropdown
   const eventTypes = [
     { value: "all", label: "All Event Types" },
-    { value: "Arts & Design Coaching", label: "Arts & Design Coaching Workshop" },
-    { value: "Seminar & Workshop", label: "Seminar & Workshop" },
-    { value: "Family Gathering", label: "Family Gathering" },
+    { value: "Arts & Design Coaching Space", label: "Arts & Design Coaching Space" },
+    { value: "Meeting, Seminar, Workshop", label: "Meeting, Seminar, Workshop" },
+    { value: "Family & Friends Gathering", label: "Family & Friends Gathering" },
     { value: "Holiday Festive", label: "Holiday Festive" },
     { value: "Other", label: "Other" },
+  ]
+
+  // Available statuses for active bookings (exclude finished and cancelled - those are in archive)
+  const availableStatuses = [
+    { value: "pending", label: "Pending" },
+    { value: "pending_deposit", label: "Pending Deposit" },
+    { value: "paid_deposit", label: "Paid Deposit" },
+    { value: "confirmed", label: "Confirmed" },
   ]
   
   // Build base endpoint with filters (without limit/offset for infinite scroll)
@@ -401,6 +415,34 @@ export default function BookingsPage() {
     threshold: 200,
     enabled: !!session && !viewDialogOpen && !statusDialogOpen,
   })
+
+  // Client-side filtering for deposit status (since API doesn't support it)
+  // Note: This works with infinite scroll but may show fewer items per "page"
+  // since filtering happens after loading
+  const filteredBookings = useMemo(() => {
+    if (depositStatusFilter === "all") {
+      return bookings
+    }
+    return bookings.filter((booking) => {
+      switch (depositStatusFilter) {
+        case "no_deposit":
+          return !booking.deposit_evidence_url && !booking.deposit_verified_at
+        case "deposit_available":
+          return booking.deposit_evidence_url && !booking.deposit_verified_at
+        case "deposit_verified":
+          return booking.deposit_evidence_url && booking.deposit_verified_at
+        case "deposit_verified_other_channel":
+          return !booking.deposit_evidence_url && booking.deposit_verified_at && booking.deposit_verified_from_other_channel
+        default:
+          return true
+      }
+    })
+  }, [bookings, depositStatusFilter])
+  
+  // When deposit filter is active, we still load more but filter client-side
+  // This means hasMore might be true even if filtered results are empty
+  const displayTotal = depositStatusFilter === "all" ? total : filteredBookings.length
+  const displayHasMore = depositStatusFilter === "all" ? hasMore : (filteredBookings.length < bookings.length || hasMore)
   
   // Initialize booking actions hook
   const {
@@ -441,9 +483,13 @@ export default function BookingsPage() {
       if (isCancelled || isRestoration) {
         setViewDialogOpen(false)
         setSelectedBooking(null)
-      } else if (viewDialogOpen) {
+      } else if (viewDialogOpen && selectedBooking?.id) {
         // For other status changes, refresh booking details in view dialog
-        fetchBookingDetails(selectedBooking?.id || "")
+        // CRITICAL: Add delay to ensure cache is invalidated and database is updated
+        // This prevents stale status from being displayed
+        setTimeout(() => {
+          fetchBookingDetails(selectedBooking.id)
+        }, 100) // Small delay to ensure backend cache invalidation completes
       }
     },
   })
@@ -603,10 +649,12 @@ export default function BookingsPage() {
                 description: `Event: ${booking.event_type}`,
                 action: {
                   label: "View",
-                  onClick: () => {
-                    setSelectedBooking(booking)
+                  onClick: async () => {
+                    // CRITICAL: Don't set selectedBooking from list - it might be stale
+                    // Wait for fresh data from API
+                    setLoadingBookingDetails(true)
                     setViewDialogOpen(true)
-                    fetchBookingDetails(booking.id)
+                    await fetchBookingDetails(booking.id)
                   },
                 },
                 duration: 5000,
@@ -632,10 +680,12 @@ export default function BookingsPage() {
                     description: "A deposit evidence has been uploaded and requires verification.",
                     action: {
                       label: "View",
-                      onClick: () => {
-                        setSelectedBooking(booking)
+                      onClick: async () => {
+                        // CRITICAL: Don't set selectedBooking from list - it might be stale
+                        // Wait for fresh data from API
+                        setLoadingBookingDetails(true)
                         setViewDialogOpen(true)
-                        fetchBookingDetails(booking.id)
+                        await fetchBookingDetails(booking.id)
                       },
                     },
                     duration: 8000,
@@ -647,10 +697,12 @@ export default function BookingsPage() {
                   description: `Status changed from "${lastKnown.status}" to "${booking.status}"`,
                   action: {
                     label: "View",
-                    onClick: () => {
-                      setSelectedBooking(booking)
+                    onClick: async () => {
+                      // CRITICAL: Don't set selectedBooking from list - it might be stale
+                      // Wait for fresh data from API
+                      setLoadingBookingDetails(true)
                       setViewDialogOpen(true)
-                      fetchBookingDetails(booking.id)
+                      await fetchBookingDetails(booking.id)
                     },
                   },
                   duration: 5000,
@@ -722,16 +774,20 @@ export default function BookingsPage() {
       
       if (json.success) {
         const unavailableDatesArray = json.data?.unavailableDates || json.unavailableDates || []
+        const unavailableTimeRangesArray = json.data?.unavailableTimeRanges || json.unavailableTimeRanges || []
         setUnavailableDatesForDateChange(new Set(unavailableDatesArray))
+        setUnavailableTimeRangesForDateChange(unavailableTimeRangesArray)
         console.log(`[Admin] Unavailable dates fetched for date change (excluding booking ${bookingId || 'none'}): ${unavailableDatesArray.length} dates`)
       } else {
         console.error("[Admin] Failed to fetch unavailable dates for date change:", json)
         setUnavailableDatesForDateChange(new Set())
+        setUnavailableTimeRangesForDateChange([])
       }
-    } catch (error) {
-      console.error("Failed to fetch unavailable dates for date change:", error)
-      setUnavailableDatesForDateChange(new Set())
-    }
+      } catch (error) {
+        console.error("Failed to fetch unavailable dates for date change:", error)
+        setUnavailableDatesForDateChange(new Set())
+        setUnavailableTimeRangesForDateChange([])
+      }
   }, [])
 
   // Fetch unavailable dates when date change dialog opens and initialize date range toggle
@@ -741,12 +797,13 @@ export default function BookingsPage() {
       fetchUnavailableDatesForDateChange(selectedBooking.id)
       // Initialize date range toggle based on current booking
       setDateRangeToggle(selectedBooking.end_date ? "multiple" : "single")
-    } else {
-      // Clear unavailable dates when dialog closes
-      setUnavailableDatesForDateChange(new Set())
-      // Reset date range toggle
-      setDateRangeToggle("single")
-    }
+      } else {
+        // Clear unavailable dates when dialog closes
+        setUnavailableDatesForDateChange(new Set())
+        setUnavailableTimeRangesForDateChange([])
+        // Reset date range toggle
+        setDateRangeToggle("single")
+      }
   }, [selectedAction, selectedBooking?.id, selectedBooking?.status, selectedBooking?.end_date, fetchUnavailableDatesForDateChange])
 
   // Polling integration: Refresh unavailable dates when date change dialog is open
@@ -780,6 +837,9 @@ export default function BookingsPage() {
           console.log('[fetchBookingDetails] Received booking data:', {
             bookingId,
             hasBooking: !!booking,
+            status: booking?.status,
+            oldStatus: selectedBooking?.status,
+            statusChanged: selectedBooking?.status !== booking?.status,
             fee_amount: booking?.fee_amount,
             feeAmount: booking?.feeAmount,
             fee_currency: booking?.fee_currency,
@@ -824,6 +884,21 @@ export default function BookingsPage() {
       setLoadingBookingDetails(false)
     }
   }
+  
+  // Helper function to refresh booking details dialog after admin actions
+  // This ensures the dialog always shows the latest status and data
+  const refreshBookingDetailsDialog = useCallback(async (bookingId: string) => {
+    if (!viewDialogOpen || !bookingId) return
+    
+    // Reset the ref to force refetch
+    lastFetchedBookingIdRef.current = null
+    
+    // Add small delay to ensure backend cache invalidation completes
+    await new Promise(resolve => setTimeout(resolve, 150))
+    
+    // Fetch fresh data
+    await fetchBookingDetails(bookingId)
+  }, [viewDialogOpen, fetchBookingDetails])
 
   // Handle delete booking - open confirmation dialog
   const handleDeleteBooking = (bookingId: string) => {
@@ -902,6 +977,19 @@ export default function BookingsPage() {
     return mapActionToStatus(action as any, currentStatus as any) || currentStatus
   }
 
+  // Check action locks for selected booking and action
+  const { 
+    lockStatus: actionLockStatus, 
+    isLockedByOther: isActionLockedByOther,
+    isLockedByMe: isActionLockedByMe,
+  } = useActionLocks({
+    resourceType: 'booking',
+    resourceId: selectedBooking?.id,
+    action: selectedAction || undefined,
+    pollInterval: 3000, // Poll every 3 seconds for lock status
+    enabled: !!selectedBooking && !!selectedAction && statusDialogOpen,
+  })
+
   // Handle action update with validation
   const handleActionUpdate = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -909,6 +997,15 @@ export default function BookingsPage() {
 
     if (!selectedAction) {
       toast.error("Please select an action")
+      return
+    }
+
+    // CRITICAL: Check if action is locked by another admin
+    if (isActionLockedByOther) {
+      const lockedBy = actionLockStatus.lockedBy || "another admin"
+      toast.error(`This action is currently being performed by ${lockedBy}. Please wait a moment and try again.`, {
+        duration: 5000,
+      })
       return
     }
 
@@ -963,6 +1060,15 @@ export default function BookingsPage() {
   // Execute action directly (after confirmation if needed)
   const executeActionDirectly = async (actionDef: ActionDefinition) => {
     if (!selectedBooking) return
+
+    // CRITICAL: Double-check lock status before executing
+    if (isActionLockedByOther) {
+      const lockedBy = actionLockStatus.lockedBy || "another admin"
+      toast.error(`This action is currently being performed by ${lockedBy}. Please wait a moment and try again.`, {
+        duration: 5000,
+      })
+      return
+    }
 
     setSaving(true)
     const form = document.querySelector('form[onSubmit]') as HTMLFormElement
@@ -1245,9 +1351,10 @@ export default function BookingsPage() {
         if (isCancelled || isRestoration) {
           setViewDialogOpen(false)
           setSelectedBooking(null)
-        } else if (viewDialogOpen) {
-          // For other status changes, refresh booking details in view dialog
-          fetchBookingDetails(selectedBooking.id)
+        } else if (viewDialogOpen && selectedBooking?.id) {
+          // CRITICAL: Always refresh booking details after any admin update action
+          // This ensures the dialog shows the latest status and data
+          await refreshBookingDetailsDialog(selectedBooking.id)
         }
       } else {
           // Rollback on error
@@ -1333,8 +1440,8 @@ export default function BookingsPage() {
     }
 
     // Validate status allows fee recording
-    if (selectedBooking.status !== "confirmed" && selectedBooking.status !== "finished") {
-      toast.error("Fee can only be recorded for confirmed or finished bookings")
+    if (selectedBooking.status !== "confirmed" && selectedBooking.status !== "finished" && selectedBooking.status !== "cancelled") {
+      toast.error("Fee can only be recorded for confirmed, finished, or cancelled bookings")
       return
     }
 
@@ -1437,8 +1544,11 @@ export default function BookingsPage() {
           }
         }
         
-        // Refresh booking details to get latest data including fee history
-        await fetchBookingDetails(selectedBooking.id)
+        // CRITICAL: Always refresh booking details after fee update
+        // This ensures the dialog shows the latest fee data and status
+        if (viewDialogOpen) {
+          await refreshBookingDetailsDialog(selectedBooking.id)
+        }
         
         // Invalidate and refetch bookings list to ensure fresh data
         // Trigger invalidation event for React Query cache
@@ -1500,122 +1610,6 @@ export default function BookingsPage() {
     }
   }, [feeAmountOriginal, feeCurrency, feeConversionRate, feeAmount, feeDialogOpen])
 
-  const getStatusBadge = (status: string) => {
-    const variants: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
-      pending: "outline",
-      pending_deposit: "secondary",
-      confirmed: "default",
-      cancelled: "destructive",
-      finished: "default",
-    }
-    const colors: Record<string, string> = {
-      pending: "bg-yellow-100 text-yellow-800 border-yellow-300",
-      pending_deposit: "bg-orange-100 text-orange-800 border-orange-300",
-      confirmed: "bg-green-100 text-green-800 border-green-300",
-      cancelled: "bg-gray-100 text-gray-800 border-gray-300",
-      finished: "bg-gray-100 text-gray-800 border-gray-300",
-    }
-    return (
-      <Badge className={colors[status] || ""} variant={variants[status] || "default"}>
-        {status === "pending_deposit" ? "Pending Deposit" : status === "confirmed" ? "Confirmed" : status.charAt(0).toUpperCase() + status.slice(1)}
-      </Badge>
-    )
-  }
-
-  const formatTimestamp = (timestamp: number | null | undefined) => {
-    if (timestamp === null || timestamp === undefined || timestamp === 0) return "N/A"
-    try {
-      // Handle both Unix timestamp (seconds) and milliseconds
-      const timestampMs = timestamp > 1000000000000 
-        ? timestamp // Already in milliseconds
-        : timestamp * 1000 // Convert from seconds to milliseconds
-      
-      // CRITICAL: Convert UTC timestamp to Bangkok timezone for display
-      // Timestamps in DB are UTC but represent Bangkok time
-      const utcDate = new Date(timestampMs)
-      const bangkokDate = new TZDate(utcDate.getTime(), 'Asia/Bangkok')
-      
-      return format(bangkokDate, "MMM dd, yyyy 'at' h:mm a")
-    } catch (error) {
-      console.error("Error formatting timestamp:", timestamp, error)
-      return "N/A"
-    }
-  }
-
-  const formatDate = (timestamp: number | null | undefined) => {
-    if (timestamp === null || timestamp === undefined || timestamp === 0) return "N/A"
-    try {
-      // Handle both Unix timestamp (seconds) and milliseconds
-      const timestampMs = timestamp > 1000000000000 
-        ? timestamp // Already in milliseconds
-        : timestamp * 1000 // Convert from seconds to milliseconds
-      
-      // Convert UTC timestamp to Bangkok timezone for display
-      // Timestamps in DB are UTC but represent Bangkok time
-      const utcDate = new Date(timestampMs)
-      const bangkokDate = new TZDate(utcDate.getTime(), 'Asia/Bangkok')
-      
-      return format(bangkokDate, "MMM dd, yyyy")
-    } catch (error) {
-      console.error("Error formatting date:", timestamp, error)
-      return "N/A"
-    }
-  }
-
-  const formatFee = (booking: Booking) => {
-    // Handle both snake_case (from API) and camelCase (from formatBooking)
-    const feeAmount = (booking as any).fee_amount ?? (booking as any).feeAmount
-    const feeAmountOriginal = (booking as any).fee_amount_original ?? (booking as any).feeAmountOriginal
-    const feeCurrency = (booking as any).fee_currency ?? (booking as any).feeCurrency
-    
-    // Debug logging (remove in production if needed)
-    if (process.env.NODE_ENV === 'development') {
-      console.log('[formatFee] Booking fee data:', {
-        bookingId: booking.id,
-        bookingReference: (booking as any).reference_number,
-        fee_amount: (booking as any).fee_amount,
-        feeAmount: (booking as any).feeAmount,
-        feeAmountResolved: feeAmount,
-        feeAmountType: typeof feeAmount,
-        feeCurrency,
-        feeAmountOriginal,
-        allFeeKeys: Object.keys(booking).filter(k => k.toLowerCase().includes('fee')),
-        fullBooking: booking,
-      })
-    }
-    
-    // Check if fee exists and is a valid positive number
-    // Handle both number and string types
-    let feeNum: number | null = null
-    if (feeAmount != null && feeAmount !== undefined) {
-      if (typeof feeAmount === 'string') {
-        feeNum = parseFloat(feeAmount)
-      } else if (typeof feeAmount === 'number') {
-        feeNum = feeAmount
-      } else {
-        feeNum = Number(feeAmount)
-      }
-    }
-    
-    if (feeNum === null || isNaN(feeNum) || feeNum <= 0) {
-      if (process.env.NODE_ENV === 'development') {
-        console.log('[formatFee] Fee check failed:', { feeNum, feeAmount, isNull: feeAmount === null, isUndefined: feeAmount === undefined })
-      }
-      return <span className="text-gray-400 italic">Not recorded</span>
-    }
-    
-    const baseAmount = feeNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    if (feeCurrency && feeCurrency.toUpperCase() !== "THB" && feeAmountOriginal) {
-      const originalAmount = Number(feeAmountOriginal).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-      return (
-        <div className="text-sm">
-          <div className="font-medium text-gray-900">{baseAmount} THB</div>
-          <div className="text-gray-500 text-xs">{originalAmount} {feeCurrency}</div>
-        </div>
-      )
-    }
-    return <span className="text-sm font-medium text-gray-900">{baseAmount} THB</span>
-  }
 
   // Only show full-page loading on initial load (when there's no data yet)
   // When refetching with existing data, show content with a subtle loading indicator
@@ -1710,6 +1704,9 @@ export default function BookingsPage() {
         sortOrder={sortOrder}
         onSortOrderChange={setSortOrder}
         eventTypes={eventTypes}
+        statuses={availableStatuses}
+        depositStatusFilter={depositStatusFilter}
+        onDepositStatusFilterChange={setDepositStatusFilter}
         onClearAll={() => {
           setStatusFilter("all")
           setStatusFilters([])
@@ -1723,6 +1720,7 @@ export default function BookingsPage() {
           setDebouncedNameFilter("")
           setDebouncedPhoneFilter("")
           setEventTypeFilter("all")
+          setDepositStatusFilter("all")
           setShowOverlappingOnly(false)
           setStartDateFrom("")
           setStartDateTo("")
@@ -1733,7 +1731,8 @@ export default function BookingsPage() {
           statusFilters.length > 0 || 
           debouncedEmailFilter || 
           debouncedReferenceNumberFilter || 
-          debouncedNameFilter || 
+          debouncedNameFilter ||
+          depositStatusFilter !== "all" || 
           debouncedPhoneFilter || 
           eventTypeFilter !== "all" || 
           showOverlappingOnly ||
@@ -1744,10 +1743,10 @@ export default function BookingsPage() {
       {/* Results Count */}
       {!loading && (
         <div className="mb-4 text-sm text-gray-600">
-          {total > 0 ? (
+          {displayTotal > 0 ? (
             <>
-              Showing <span className="font-medium">{bookings.length}</span> of <span className="font-medium">{total}</span> booking{total !== 1 ? 's' : ''}
-              {(statusFilter !== "all" || statusFilters.length > 0 || debouncedEmailFilter || debouncedReferenceNumberFilter || debouncedNameFilter || debouncedPhoneFilter || eventTypeFilter !== "all" || showOverlappingOnly || (useDateRange && (startDateFrom || startDateTo))) && (
+              Showing <span className="font-medium">{filteredBookings.length}</span> of <span className="font-medium">{displayTotal}</span> booking{displayTotal !== 1 ? 's' : ''}
+              {(statusFilter !== "all" || statusFilters.length > 0 || debouncedEmailFilter || debouncedReferenceNumberFilter || debouncedNameFilter || debouncedPhoneFilter || eventTypeFilter !== "all" || depositStatusFilter !== "all" || showOverlappingOnly || (useDateRange && (startDateFrom || startDateTo))) && (
                 <span className="ml-2 text-gray-500">(filtered)</span>
               )}
             </>
@@ -1758,350 +1757,36 @@ export default function BookingsPage() {
       )}
 
       {/* Bookings Table */}
-      {bookings.length === 0 ? (
-        <div className="text-center py-12">
-          <Calendar className="w-16 h-16 mx-auto text-gray-400 mb-4" />
-          <p className="text-gray-600">No bookings found</p>
-        </div>
-      ) : (
-        <>
-          {/* Desktop Table View */}
-          <div className="hidden lg:block bg-white rounded-lg shadow overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">
-                    No.
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Booking Reference
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Name
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Event Details
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider min-w-[180px]">
-                    Date/Time
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Fee
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Created
-                  </th>
-                    <th className="px-6 xl:px-8 py-4 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {bookings.map((booking, index) => {
-                  const hasNewResponse = booking.user_response && booking.response_date && 
-                    (booking.response_date * 1000) > lastCheckedAtRef.current - 300000 // New if within last 5 minutes
-                  
-                  return (
-                  <tr 
-                    key={booking.id} 
-                    className={`hover:bg-gray-50 ${hasNewResponse ? 'bg-blue-50 border-l-4 border-l-blue-500' : ''}`}
-                  >
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {index + 1}
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap">
-                      <div className="text-sm font-medium text-gray-900">
-                        <SearchHighlight
-                          text={getBookingReferenceNumber(booking)}
-                          searchTerm={referenceNumberFilter}
-                        />
-                      </div>
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap">
-                      <div className="flex items-center gap-2">
-                        <div className="text-sm font-medium text-gray-900">
-                          <SearchHighlight
-                            text={booking.name}
-                            searchTerm={nameFilter}
-                          />
-                        </div>
-                        {booking.user_response && (
-                          <Badge variant="outline" className="bg-blue-100 text-blue-800 border-blue-300">
-                            <AlertCircle className="w-3 h-3 mr-1" />
-                            Response
-                          </Badge>
-                        )}
-                      </div>
-                      <div className="text-sm text-gray-500 flex items-center gap-1 mt-1">
-                        <Mail className="w-3 h-3" />
-                        <SearchHighlight
-                          text={booking.email}
-                          searchTerm={emailFilter}
-                        />
-                      </div>
-                      <div className="text-sm text-gray-500 flex items-center gap-1 mt-1">
-                        <Phone className="w-3 h-3" />
-                        <SearchHighlight
-                          text={booking.phone}
-                          searchTerm={phoneFilter}
-                        />
-                      </div>
-                    </td>
-                    <td className="px-6 xl:px-8 py-4">
-                      <div className="text-sm text-gray-900">{booking.event_type}</div>
-                      {booking.organization_type && (
-                        <div className="text-sm text-gray-500">{booking.organization_type}</div>
-                      )}
-                      {booking.participants && (
-                        <div className="text-sm text-gray-500 flex items-center gap-1 mt-1">
-                          <Users className="w-3 h-3" />
-                          {booking.participants} participants
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 min-w-[180px]">
-                      <div className="text-sm text-gray-900">
-                        {formatDate(booking.start_date)}
-                        {booking.end_date && booking.end_date !== booking.start_date && (
-                          <span> - {formatDate(booking.end_date)}</span>
-                        )}
-                      </div>
-                      <div className="text-sm text-gray-500 flex items-center gap-1 mt-1.5">
-                        <Clock className="w-3 h-3 flex-shrink-0" />
-                        <span className="whitespace-normal break-words">{formatTimeForDisplay(booking.start_time)} - {formatTimeForDisplay(booking.end_time)}</span>
-                      </div>
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap">
-                      {getStatusBadge(booking.status)}
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap">
-                      {formatFee(booking)}
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {formatTimestamp(booking.created_at)}
-                    </td>
-                    <td className="px-6 xl:px-8 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      <div className="flex items-center gap-2 justify-end">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={async () => {
-                            setViewDialogOpen(true)
-                            // Don't set selectedBooking from list - wait for fresh data from API
-                            await fetchBookingDetails(booking.id)
-                          }}
-                        >
-                          <Eye className="w-4 h-4 mr-1" />
-                          View
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="destructive"
-                          onClick={() => handleDeleteBooking(booking.id)}
-                          disabled={saving}
-                        >
-                          <Trash2 className="w-4 h-4 mr-1" />
-                          Delete
-                        </Button>
-                      </div>
-                    </td>
-                  </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-          {/* Page size selector and total count */}
-          <div className="px-6 py-3 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
-            <div className="text-sm text-gray-700">
-              Showing <span className="font-medium">{bookings.length}</span> of <span className="font-medium">{total}</span> bookings
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-gray-700">Items per page:</span>
-              <Select
-                value={pageSize.toString()}
-                onValueChange={(value) => {
-                  setPageSize(parseInt(value))
-                  fetchBookings()
-                }}
-              >
-                <SelectTrigger className="w-20 h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="10">10</SelectItem>
-                  <SelectItem value="25">25</SelectItem>
-                  <SelectItem value="50">50</SelectItem>
-                  <SelectItem value="100">100</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          {/* Infinite scroll sentinel */}
-          {hasMore && (
-            <div ref={scrollSentinelRef} className="py-4 flex justify-center">
-              {loading && <Loader2 className="w-6 h-6 animate-spin text-gray-400" />}
-            </div>
-          )}
-          {!hasMore && bookings.length > 0 && (
-            <div className="px-6 py-3 bg-gray-50 border-t border-gray-200 text-center text-sm text-gray-500">
-              No more bookings to load
-            </div>
-          )}
-        </div>
-
-          {/* Mobile/Tablet Card View */}
-          <div className="lg:hidden space-y-4">
-            {bookings.map((booking, index) => {
-              const hasNewResponse = booking.user_response && booking.response_date && 
-                (booking.response_date * 1000) > lastCheckedAtRef.current - 300000
-              
-              return (
-                <div
-                  key={booking.id}
-                  className={`bg-white rounded-lg shadow p-4 sm:p-6 ${hasNewResponse ? 'border-l-4 border-l-blue-500' : ''}`}
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-2">
-                        <span className="text-xs font-medium text-gray-500">#{index + 1}</span>
-                        <h3 className="text-base sm:text-lg font-semibold text-gray-900">{booking.name}</h3>
-                        {booking.user_response && (
-                          <Badge variant="outline" className="bg-blue-100 text-blue-800 border-blue-300">
-                            <AlertCircle className="w-3 h-3 mr-1" />
-                            Response
-                          </Badge>
-                        )}
-                      </div>
-                      <div className="mb-2">
-                        <div className="text-xs font-medium text-gray-500 mb-0.5">Booking Reference</div>
-                        <div className="text-sm font-medium text-gray-900">{getBookingReferenceNumber(booking)}</div>
-                      </div>
-                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500">
-                        <div className="flex items-center gap-1">
-                          <Mail className="w-3 h-3" />
-                          {booking.email}
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <Phone className="w-3 h-3" />
-                          {booking.phone}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="ml-2">
-                      {getStatusBadge(booking.status)}
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 mb-4">
-                    <div>
-                      <div className="text-xs font-medium text-gray-500 mb-1">Event</div>
-                      <div className="text-sm text-gray-900">{booking.event_type}</div>
-                      {booking.organization_type && (
-                        <div className="text-xs text-gray-500 mt-0.5">{booking.organization_type}</div>
-                      )}
-                      {booking.participants && (
-                        <div className="text-xs text-gray-500 flex items-center gap-1 mt-1">
-                          <Users className="w-3 h-3" />
-                          {booking.participants} participants
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <div className="text-xs font-medium text-gray-500 mb-1">Date/Time</div>
-                      <div className="text-sm text-gray-900">
-                        {formatDate(booking.start_date)}
-                        {booking.end_date && booking.end_date !== booking.start_date && (
-                          <span> - {formatDate(booking.end_date)}</span>
-                        )}
-                      </div>
-                      <div className="text-sm text-gray-500 flex items-center gap-1 mt-1">
-                        <Clock className="w-3 h-3 flex-shrink-0" />
-                        {formatTimeForDisplay(booking.start_time)} - {formatTimeForDisplay(booking.end_time)}
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="text-xs font-medium text-gray-500 mb-1">Fee</div>
-                      <div className="text-sm text-gray-900">{formatFee(booking)}</div>
-                    </div>
-
-                    <div>
-                      <div className="text-xs font-medium text-gray-500 mb-1">Created</div>
-                      <div className="text-sm text-gray-500">{formatTimestamp(booking.created_at)}</div>
-                    </div>
-                  </div>
-
-                  <div className="flex gap-2 pt-3 border-t">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="flex-1"
-                      onClick={async () => {
-                        setViewDialogOpen(true)
-                        // Don't set selectedBooking from list - wait for fresh data from API
-                        await fetchBookingDetails(booking.id)
-                      }}
-                    >
-                      <Eye className="w-4 h-4 mr-1" />
-                      View
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="destructive"
-                      className="flex-1"
-                      onClick={() => handleDeleteBooking(booking.id)}
-                      disabled={saving}
-                    >
-                      <Trash2 className="w-4 h-4 mr-1" />
-                      Delete
-                    </Button>
-                  </div>
-                </div>
-              )
-            })}
-            {/* Page size selector and total count for mobile */}
-            <div className="bg-white rounded-lg shadow px-4 py-3 border-t border-gray-200 flex items-center justify-between">
-              <div className="text-sm text-gray-700">
-                Showing <span className="font-medium">{bookings.length}</span> of <span className="font-medium">{total}</span>
-              </div>
-              <Select
-                value={pageSize.toString()}
-                onValueChange={(value) => {
-                  setPageSize(parseInt(value))
-                  fetchBookings()
-                }}
-              >
-                <SelectTrigger className="w-20 h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="10">10</SelectItem>
-                  <SelectItem value="25">25</SelectItem>
-                  <SelectItem value="50">50</SelectItem>
-                  <SelectItem value="100">100</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {/* Infinite scroll sentinel */}
-            {hasMore && (
-              <div ref={scrollSentinelRef} className="py-4 flex justify-center">
-                {loading && <Loader2 className="w-6 h-6 animate-spin text-gray-400" />}
-              </div>
-            )}
-            {!hasMore && bookings.length > 0 && (
-              <div className="bg-white rounded-lg shadow px-4 py-3 text-center text-sm text-gray-500">
-                No more bookings to load
-              </div>
-            )}
-          </div>
-        </>
-      )}
+      <BookingTable
+        bookings={filteredBookings}
+        total={displayTotal}
+        loading={loading}
+        hasMore={displayHasMore}
+        pageSize={pageSize}
+        onPageSizeChange={(size) => {
+          setPageSize(size)
+          fetchBookings()
+        }}
+        onViewBooking={async (bookingId) => {
+          // CRITICAL: Don't set selectedBooking from list - it might be stale
+          // Clear any existing selectedBooking to prevent showing stale data
+          // Wait for fresh data from API before opening dialog
+          setSelectedBooking(null) // Clear stale data first
+          setLoadingBookingDetails(true)
+          setViewDialogOpen(true)
+          // Reset the ref so useEffect will refetch
+          lastFetchedBookingIdRef.current = null
+          await fetchBookingDetails(bookingId)
+        }}
+        onDeleteBooking={handleDeleteBooking}
+        saving={saving}
+        scrollSentinelRef={scrollSentinelRef}
+        referenceNumberFilter={referenceNumberFilter}
+        nameFilter={nameFilter}
+        emailFilter={emailFilter}
+        phoneFilter={phoneFilter}
+        lastCheckedAt={lastCheckedAtRef.current}
+      />
 
       {/* View Booking Dialog */}
       <Dialog open={viewDialogOpen} onOpenChange={setViewDialogOpen}>
@@ -2275,6 +1960,12 @@ export default function BookingsPage() {
                 <h3 className="text-lg font-semibold mb-3">Contact Information</h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
+                    <Label>Reference Number</Label>
+                    <div className="text-sm text-gray-900 font-semibold text-blue-600">
+                      {getBookingReferenceNumber(selectedBooking)}
+                    </div>
+                  </div>
+                  <div>
                     <Label>Name</Label>
                     <div className="text-sm text-gray-900">{selectedBooking.name}</div>
                   </div>
@@ -2425,6 +2116,60 @@ export default function BookingsPage() {
                       {((selectedBooking as any).fee_amount ?? (selectedBooking as any).feeAmount) ? "Update Fee" : "Record Fee"}
                     </Button>
                   )}
+                  {((selectedBooking as any).fee_amount ?? (selectedBooking as any).feeAmount) && (
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      onClick={async () => {
+                        if (!selectedBooking) return
+                        
+                        if (!confirm("Are you sure you want to clear the fee for this booking? This action cannot be undone.")) {
+                          return
+                        }
+                        
+                        setSaving(true)
+                        try {
+                          const response = await fetch(buildApiUrl(API_PATHS.adminBooking(selectedBooking.id) + "/fee"), {
+                            method: "PATCH",
+                            headers: {
+                              "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({
+                              feeAmountOriginal: null,
+                              feeCurrency: null,
+                              changeReason: "Fee cleared by admin",
+                            }),
+                          })
+                          
+                          const json = await response.json()
+                          
+                          if (json.success) {
+                            toast.success("Fee cleared successfully")
+                            // Update selected booking with cleared fee
+                            if (json.data?.booking) {
+                              setSelectedBooking({
+                                ...selectedBooking,
+                                ...json.data.booking,
+                              })
+                            }
+                            // Refresh bookings list
+                            fetchBookings()
+                          } else {
+                            toast.error(json.error?.message || "Failed to clear fee")
+                          }
+                        } catch (error) {
+                          toast.error("Failed to clear fee")
+                          console.error(error)
+                        } finally {
+                          setSaving(false)
+                        }
+                      }}
+                      disabled={saving}
+                    >
+                      Clear Fee
+                    </Button>
+                  )}
                 </div>
                 {(() => {
                   // Handle both camelCase (from formatBooking) and snake_case (from useAdminBookings)
@@ -2527,11 +2272,11 @@ export default function BookingsPage() {
                   ) : (
                     <div className="bg-gray-50 border border-gray-200 rounded p-4">
                       <p className="text-sm text-gray-500 italic">No fee recorded yet</p>
-                      {(selectedBooking.status === "confirmed" || selectedBooking.status === "finished") && (
+                      {(selectedBooking.status === "confirmed" || selectedBooking.status === "finished" || selectedBooking.status === "cancelled") && (
                         <p className="text-xs text-gray-400 mt-2">Click "Record Fee" to add fee information</p>
                       )}
-                      {(selectedBooking.status !== "confirmed" && selectedBooking.status !== "finished") && (
-                        <p className="text-xs text-yellow-600 mt-2">Fee can only be recorded when booking is confirmed or finished</p>
+                      {(selectedBooking.status !== "confirmed" && selectedBooking.status !== "finished" && selectedBooking.status !== "cancelled") && (
+                        <p className="text-xs text-yellow-600 mt-2">Fee can only be recorded when booking is confirmed, finished, or cancelled</p>
                       )}
                     </div>
                   )
@@ -2673,6 +2418,29 @@ export default function BookingsPage() {
                   <AlertTitle className="text-red-900">⚠️ Booking Blocked by Confirmed Overlap</AlertTitle>
                   <AlertDescription className="text-red-800">
                     Another booking with the same date/time is already CONFIRMED. You can only CANCEL this booking until the confirmed booking is cancelled or auto-cancelled.
+                  </AlertDescription>
+                </Alert>
+              )}
+              
+              {/* Show lock status warning if action is locked by another admin */}
+              {isActionLockedByOther && (
+                <Alert variant="destructive" className="bg-orange-50 border-orange-200">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertTitle className="text-orange-900">🔒 Action Locked by Another Admin</AlertTitle>
+                  <AlertDescription className="text-orange-800">
+                    This action is currently being performed by {actionLockStatus.lockedBy || "another admin"}. 
+                    Please wait a moment and try again. The page will automatically update when the lock is released.
+                  </AlertDescription>
+                </Alert>
+              )}
+              
+              {/* Show lock status info if action is locked by current admin */}
+              {isActionLockedByMe && (
+                <Alert variant="default" className="bg-blue-50 border-blue-200">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertTitle className="text-blue-900">🔒 Action Locked by You</AlertTitle>
+                  <AlertDescription className="text-blue-800">
+                    You have an active lock on this action. You can proceed with the action.
                   </AlertDescription>
                 </Alert>
               )}
@@ -3075,6 +2843,12 @@ export default function BookingsPage() {
                               }
                               return isUnavailable
                             }}
+                            isOccupied={(date) => {
+                              // Check if date is occupied (has confirmed booking)
+                              const dateStr = dateToBangkokDateString(date)
+                              return unavailableDatesForDateChange.has(dateStr)
+                            }}
+                            occupiedTimeRanges={unavailableTimeRangesForDateChange}
                           />
                         </PopoverContent>
                       </Popover>
@@ -3126,6 +2900,12 @@ export default function BookingsPage() {
                                 }
                                 return isUnavailable
                               }}
+                              isOccupied={(date) => {
+                                // Check if date is occupied (has confirmed booking)
+                                const dateStr = dateToBangkokDateString(date)
+                                return unavailableDatesForDateChange.has(dateStr)
+                              }}
+                              occupiedTimeRanges={unavailableTimeRangesForDateChange}
                             />
                           </PopoverContent>
                         </Popover>
@@ -3306,9 +3086,11 @@ export default function BookingsPage() {
                   disabled={
                     saving || 
                     !selectedAction || 
+                    isActionLockedByOther || // Disable if locked by another admin
                     (selectedBooking.status === "pending_deposit" && selectedAction !== "reject_deposit" && selectedAction !== "cancel")
                   }
                   className="w-full sm:w-auto"
+                  title={isActionLockedByOther ? `This action is locked by ${actionLockStatus.lockedBy || "another admin"}` : undefined}
                 >
                   {saving ? (
                     <>
@@ -3349,7 +3131,7 @@ export default function BookingsPage() {
             <DialogDescription>
               {selectedBooking?.fee_amount 
                 ? "Update the fee for this booking. Changes will be logged in fee history."
-                : "Record the fee for this booking. Fee can only be recorded for confirmed or finished bookings."}
+                : "Record the fee for this booking. Fee can be recorded for confirmed, finished, or cancelled bookings."}
             </DialogDescription>
           </DialogHeader>
           {selectedBooking && (

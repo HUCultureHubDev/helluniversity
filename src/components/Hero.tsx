@@ -1,6 +1,7 @@
 "use client"
 import { withBasePath } from "@/lib/utils"
 import { useState, useEffect } from "react"
+import Image from "next/image"
 import { Facebook, Twitter, Instagram, ChevronDown } from "lucide-react"
 import { API_PATHS } from "@/lib/api-config"
 import Link from "next/link"
@@ -141,15 +142,15 @@ export function Hero() {
           {/* Portrait Image */}
           <div className="flex items-stretch 4xl:items-center 5xl:items-center justify-start px-4 sm:px-6 min-[769px]:px-8 lg:pl-0 lg:pr-12 3xl:pr-20 4xl:pr-28 5xl:pr-36 pt-[calc(var(--header-h)+1rem)] lg:pt-[calc(var(--header-h)+3rem)] 4xl:pt-0 pb-[clamp(2rem,8vh,5rem)] lg:pb-[clamp(3rem,10vh,6rem)] 4xl:pb-0 relative lg:h-full">
             <div className="relative self-start 4xl:self-center 5xl:self-center w-full lg:w-fit overflow-hidden h-auto max-w-[560px] min-[769px]:max-w-[620px] lg:max-w-[700px] 3xl:max-w-[780px] 4xl:max-w-[880px] 5xl:max-w-[980px]">
-              <img
+              <Image
                 src={withBasePath('/assets/portrait/portrait_kade.png')}
                 alt="Kade Javanalikikorn - Founder of Hell University cultural hub in Mae Taeng, Chiang Mai, Thailand"
-                className="w-full h-auto lg:max-h-[65vh] object-contain object-left grayscale contrast-110"
                 width={1600}
                 height={1800}
-                loading="eager"
-                decoding="async"
-                fetchPriority="high"
+                className="w-full h-auto lg:max-h-[65vh] object-contain object-left grayscale contrast-110"
+                priority
+                quality={75}
+                sizes="(max-width: 768px) 100vw, (max-width: 1024px) 50vw, (max-width: 1280px) 45vw, 40vw"
               />
               
               {/* Quote Overlay */}
@@ -169,13 +170,13 @@ export function Hero() {
           {/* Social Icons */}
           <div className="absolute bottom-3 sm:bottom-5 min-[769px]:bottom-10 right-2 sm:right-4 min-[769px]:right-6 lg:right-12 3xl:right-16 4xl:right-24 5xl:right-32 flex flex-row min-[769px]:flex-col gap-3 sm:gap-4 min-[769px]:gap-6 z-30">
             <a 
-              href="https://www.facebook.com/kadejavanalikhikara" 
+              href="https://www.facebook.com/profile.php?id=61584042783910" 
               target="_blank" 
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 text-white hover:text-[#D4AF37] transition-colors cursor-pointer"
             >
               <Facebook size={18} className="flex-shrink-0" />
-              <span className="text-[clamp(12px,1vw,16px)]">Kade Javanalikhikara</span>
+              <span className="text-[clamp(12px,1vw,16px)]">HU Culture Hub</span>
             </a>
           </div>
 
